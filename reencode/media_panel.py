@@ -2,6 +2,7 @@ import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont
@@ -133,18 +134,28 @@ def _recommended_output_path(path: str, recommended_label: str) -> str:
         index += 1
 
 
+def _temporary_output_path(final_output_path: str) -> str:
+    final_output = Path(final_output_path)
+    suffix = final_output.suffix or ".mkv"
+    token = uuid4().hex[:8]
+    temp_name = f"{final_output.stem}.reencode-temp-{token}{suffix}"
+    return str(final_output.with_name(temp_name))
+
+
 class _ConversionThread(QThread):
     progress = Signal(str, int, int, object)
     finished = Signal(bool, str)
 
-    def __init__(self, jobs: list[tuple[str, str]], parent=None):
+    def __init__(self, jobs: list[tuple[str, str]], replace_originals: bool, parent=None):
         super().__init__(parent)
         self._jobs = jobs
+        self._replace_originals = replace_originals
 
     def run(self):
         total_jobs = len(self._jobs)
 
-        for job_index, (source_path, output_path) in enumerate(self._jobs, start=1):
+        for job_index, (source_path, final_output_path) in enumerate(self._jobs, start=1):
+            temp_output_path = _temporary_output_path(final_output_path)
             probe_info = codec_probe.probe_media_info(source_path) or {}
             codec_name = (probe_info.get("video_codec") or "").lower()
             _status, recommended_label, _reason = codec_probe.recommendation(codec_name)
@@ -171,7 +182,7 @@ class _ConversionThread(QThread):
                 "copy",
                 "-c:s",
                 "copy",
-                output_path,
+                temp_output_path,
             ]
 
             try:
@@ -223,6 +234,11 @@ class _ConversionThread(QThread):
             return_code = process.wait()
 
             if return_code != 0:
+                if os.path.exists(temp_output_path):
+                    try:
+                        os.remove(temp_output_path)
+                    except OSError:
+                        pass
                 details = stderr_output or f"ffmpeg failed for {os.path.basename(source_path)}"
                 self.finished.emit(False, details)
                 return
@@ -230,7 +246,20 @@ class _ConversionThread(QThread):
             if duration_seconds and last_emitted_percent != 100:
                 self.progress.emit(source_path, job_index - 1, total_jobs, 100)
 
-        self.finished.emit(True, f"Converted {total_jobs} file(s).")
+            if not os.path.exists(temp_output_path):
+                self.finished.emit(False, f"Conversion output was not produced for {os.path.basename(source_path)}")
+                return
+
+            try:
+                os.replace(temp_output_path, final_output_path)
+            except OSError as exc:
+                self.finished.emit(False, f"Failed to finalize {os.path.basename(source_path)}: {exc}")
+                return
+
+        if self._replace_originals:
+            self.finished.emit(True, f"Replaced {total_jobs} original file(s).")
+        else:
+            self.finished.emit(True, f"Created {total_jobs} converted file(s).")
 
 
 class MediaPanel(QWidget):
@@ -262,6 +291,11 @@ class MediaPanel(QWidget):
             self._select_all.setTristate(True)
             self._select_all.stateChanged.connect(self._on_select_all_changed)
             top_bar.addWidget(self._select_all)
+
+            self._do_not_replace = QCheckBox("Do not replace original")
+            self._do_not_replace.setChecked(False)
+            self._do_not_replace.setToolTip("When checked, conversion creates a separate .reencoded output file.")
+            top_bar.addWidget(self._do_not_replace)
 
             self._convert_button = QPushButton("Convert selected")
             self._convert_button.setEnabled(False)
@@ -360,6 +394,7 @@ class MediaPanel(QWidget):
             self._suspend_check_updates = False
 
         self._convert_button.setEnabled(selected > 0 and self._conversion_thread is None)
+        self._do_not_replace.setEnabled(total > 0 and self._conversion_thread is None)
 
     def _selected_row_count(self) -> int:
         selected = 0
@@ -369,7 +404,7 @@ class MediaPanel(QWidget):
                 selected += 1
         return selected
 
-    def _selected_video_jobs(self) -> list[tuple[str, str]]:
+    def _selected_video_jobs(self, replace_originals: bool) -> list[tuple[str, str]]:
         jobs: list[tuple[str, str]] = []
         for row in range(self._table.rowCount()):
             select_item = self._table.item(row, VCOL_SELECT)
@@ -381,7 +416,13 @@ class MediaPanel(QWidget):
             if path_item is None or rec_item is None:
                 continue
 
-            jobs.append((path_item.text(), _recommended_output_path(path_item.text(), rec_item.text())))
+            source_path = path_item.text()
+            if replace_originals:
+                final_output_path = source_path
+            else:
+                final_output_path = _recommended_output_path(source_path, rec_item.text())
+
+            jobs.append((source_path, final_output_path))
 
         return jobs
 
@@ -459,7 +500,8 @@ class MediaPanel(QWidget):
         if self._conversion_thread is not None:
             return
 
-        jobs = self._selected_video_jobs()
+        replace_originals = not self._do_not_replace.isChecked()
+        jobs = self._selected_video_jobs(replace_originals)
         if not jobs:
             QMessageBox.information(self, "Convert selected", "Select at least one video first.")
             return
@@ -468,14 +510,16 @@ class MediaPanel(QWidget):
         try:
             self._convert_button.setEnabled(False)
             self._select_all.setEnabled(False)
+            self._do_not_replace.setEnabled(False)
         finally:
             self._suspend_check_updates = False
 
-        self._conversion_thread = _ConversionThread(jobs, parent=self)
+        self._conversion_thread = _ConversionThread(jobs, replace_originals=replace_originals, parent=self)
         self._conversion_thread.progress.connect(self._on_conversion_progress)
         self._conversion_thread.finished.connect(self._on_conversion_finished)
-        self._label.setText(f"Converting {len(jobs)} file(s)...")
-        self.conversion_status_changed.emit(f"Converting {len(jobs)} file(s)...", True)
+        action = "Replacing originals" if replace_originals else "Creating converted copies"
+        self._label.setText(f"{action}: {len(jobs)} file(s)...")
+        self.conversion_status_changed.emit(f"{action}: {len(jobs)} file(s)...", True)
         self._conversion_thread.start()
 
     def _on_conversion_progress(self, source_path: str, completed_jobs: int, total_jobs: int, percent: object):
