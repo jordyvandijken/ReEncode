@@ -6,7 +6,7 @@ class ScannerThread(QThread):
     """Background thread that walks folders and emits a signal for each media file found."""
 
     file_found = Signal(str, str)   # (media_type, absolute_path)
-    scan_finished = Signal(int)     # total files found
+    discovery_finished = Signal(int)   # total files found during quick discovery
 
     def __init__(self, folders: list[str], media_types: dict[str, set[str]], parent=None):
         super().__init__(parent)
@@ -36,4 +36,4 @@ class ScannerThread(QThread):
                             count += 1
                             break  # a file matches only one type
 
-        self.scan_finished.emit(count)
+        self.discovery_finished.emit(count)

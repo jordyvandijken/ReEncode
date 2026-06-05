@@ -62,6 +62,7 @@ VCOL_SELECT, VCOL_NAME, VCOL_SIZE, VCOL_CODEC, VCOL_REC, VCOL_ESTIMATE, VCOL_PAT
 _COLOR_OPTIMAL  = QColor("#2e7d32")   # dark green
 _COLOR_GOOD     = QColor("#1565c0")   # dark blue
 _COLOR_REENCODE = QColor("#e65100")   # dark orange
+_COLOR_PENDING  = QColor("#616161")   # neutral gray
 
 
 def _recommended_ffmpeg_args(recommended_label: str) -> list[str]:
@@ -288,6 +289,69 @@ class MediaPanel(QWidget):
 
         return jobs
 
+    def _row_for_path(self, path: str) -> int | None:
+        for row in range(self._table.rowCount()):
+            path_item = self._table.item(row, VCOL_PATH if self._is_video else COL_PATH)
+            if path_item is not None and path_item.text() == path:
+                return row
+        return None
+
+    def _video_details_items(self, path: str, size_bytes: int, probe_info: dict | None):
+        raw_codec = (probe_info or {}).get("video_codec")
+        if raw_codec:
+            codec_text = codec_probe.codec_label(raw_codec)
+            status, rec_label, reason = codec_probe.recommendation(raw_codec)
+        else:
+            codec_text = "Probing..."
+            status, rec_label, reason = "pending", "Pending probe", "Codec details will appear after the async probe phase."
+
+        estimate_bytes, savings_ratio = size_estimator.estimate_output(
+            size_bytes,
+            self._media_type,
+            path,
+            probe_info,
+        )
+        if estimate_bytes is None:
+            estimate_item = _NumericItem("—", -1)
+        else:
+            estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
+            estimate_item = _NumericItem(estimate_text, estimate_bytes)
+            estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        codec_item = QTableWidgetItem(codec_text)
+
+        rec_item = QTableWidgetItem(rec_label)
+        rec_item.setToolTip(reason)
+        color = {
+            "optimal": _COLOR_OPTIMAL,
+            "good": _COLOR_GOOD,
+            "pending": _COLOR_PENDING,
+        }.get(status, _COLOR_REENCODE)
+        rec_item.setForeground(color)
+        rec_item.setFont(_bold_font(rec_item.font()))
+
+        for item in (codec_item, rec_item, estimate_item):
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+        return codec_item, rec_item, estimate_item
+
+    def _audio_estimate_item(self, path: str, size_bytes: int, probe_info: dict | None):
+        estimate_bytes, savings_ratio = size_estimator.estimate_output(
+            size_bytes,
+            self._media_type,
+            path,
+            probe_info,
+        )
+        if estimate_bytes is None:
+            estimate_item = _NumericItem("—", -1)
+        else:
+            estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
+            estimate_item = _NumericItem(estimate_text, estimate_bytes)
+            estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        return estimate_item
+
     def _convert_selected(self):
         if self._conversion_thread is not None:
             return
@@ -349,40 +413,13 @@ class MediaPanel(QWidget):
 
         size_item = _NumericItem(_human_size(size_bytes), size_bytes)
         size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        size_item.setData(Qt.ItemDataRole.UserRole, size_bytes)
 
         path_item = QTableWidgetItem(path)
         modified_item = QTableWidgetItem(modified)
 
         if self._is_video:
-            probe_info = codec_probe.probe_media_info(path)
-            raw_codec = (probe_info or {}).get("video_codec")
-            if raw_codec:
-                codec_text = codec_probe.codec_label(raw_codec)
-                status, rec_label, reason = codec_probe.recommendation(raw_codec)
-            else:
-                codec_text = "Unknown (install ffmpeg)"
-                status, rec_label, reason = "reencode", "H.265/HEVC", "Install ffmpeg/ffprobe to detect codec."
-
-            estimate_bytes, savings_ratio = size_estimator.estimate_output(
-                size_bytes,
-                self._media_type,
-                path,
-                probe_info,
-            )
-            if estimate_bytes is None:
-                estimate_item = _NumericItem("—", -1)
-            else:
-                estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
-                estimate_item = _NumericItem(estimate_text, estimate_bytes)
-                estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-            codec_item = QTableWidgetItem(codec_text)
-
-            rec_item = QTableWidgetItem(rec_label)
-            rec_item.setToolTip(reason)
-            color = {"optimal": _COLOR_OPTIMAL, "good": _COLOR_GOOD}.get(status, _COLOR_REENCODE)
-            rec_item.setForeground(color)
-            rec_item.setFont(_bold_font(rec_item.font()))
+            codec_item, rec_item, estimate_item = self._video_details_items(path, size_bytes, None)
 
             select_item = QTableWidgetItem()
             select_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
@@ -401,19 +438,7 @@ class MediaPanel(QWidget):
             self._table.setItem(row, VCOL_PATH,     path_item)
             self._table.setItem(row, VCOL_MODIFIED, modified_item)
         else:
-            probe_info = codec_probe.probe_media_info(path) if self._media_type == "Audio" else None
-            estimate_bytes, savings_ratio = size_estimator.estimate_output(
-                size_bytes,
-                self._media_type,
-                path,
-                probe_info,
-            )
-            if estimate_bytes is None:
-                estimate_item = _NumericItem("—", -1)
-            else:
-                estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
-                estimate_item = _NumericItem(estimate_text, estimate_bytes)
-                estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            estimate_item = self._audio_estimate_item(path, size_bytes, None)
 
             for item in (name_item, size_item, estimate_item, path_item, modified_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -429,6 +454,26 @@ class MediaPanel(QWidget):
         self._update_label()
         if self._is_video:
             self._refresh_video_controls()
+
+    def update_probe(self, path: str, probe_info: dict | None):
+        row = self._row_for_path(path)
+        if row is None:
+            return
+
+        size_item = self._table.item(row, VCOL_SIZE if self._is_video else COL_SIZE)
+        if size_item is None:
+            return
+
+        size_bytes = int(size_item.data(Qt.ItemDataRole.UserRole) or 0)
+
+        if self._is_video:
+            codec_item, rec_item, estimate_item = self._video_details_items(path, size_bytes, probe_info)
+            self._table.setItem(row, VCOL_CODEC, codec_item)
+            self._table.setItem(row, VCOL_REC, rec_item)
+            self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
+        else:
+            estimate_item = self._audio_estimate_item(path, size_bytes, probe_info)
+            self._table.setItem(row, COL_ESTIMATE, estimate_item)
 
     def clear(self):
         self._suspend_check_updates = True
