@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
         self._panels: dict[str, MediaPanel] = {}
         for media_type in MEDIA_TYPES:
             panel = MediaPanel(media_type)
+            panel.conversion_status_changed.connect(self._on_conversion_status_changed)
             self._panels[media_type] = panel
             self._tab_widget.addTab(panel, media_type)
         splitter.addWidget(self._tab_widget)
@@ -172,6 +173,13 @@ class MainWindow(QMainWindow):
         self._sources_panel.set_scanning(False)
         noun = "file" if self._total_found == 1 else "files"
         self._status_bar.showMessage(f"Scan complete — {self._total_found} {noun} found, {completed} probed.")
+
+    def _on_conversion_status_changed(self, message: str, active: bool):
+        if active:
+            self._status_bar.showMessage(message)
+            return
+
+        self._status_bar.showMessage(message or "Ready. Add folders and click Scan.")
 
     # ------------------------------------------------------------------
     # Clean shutdown

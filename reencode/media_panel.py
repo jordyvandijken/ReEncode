@@ -39,6 +39,45 @@ def _human_size(num_bytes: int) -> str:
         return f"{num_bytes / 1024 ** 3:.2f} GB"
 
 
+def _parse_ffmpeg_timestamp(value: str) -> float | None:
+    parts = value.split(":")
+    if len(parts) != 3:
+        return None
+
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    except ValueError:
+        return None
+
+    return (hours * 3600) + (minutes * 60) + seconds
+
+
+def _ffmpeg_progress_seconds(progress_data: dict[str, str]) -> float | None:
+    out_time = progress_data.get("out_time")
+    if out_time:
+        parsed = _parse_ffmpeg_timestamp(out_time)
+        if parsed is not None:
+            return parsed
+
+    out_time_us = progress_data.get("out_time_us")
+    if out_time_us:
+        try:
+            return int(out_time_us) / 1_000_000
+        except ValueError:
+            pass
+
+    out_time_ms = progress_data.get("out_time_ms")
+    if out_time_ms:
+        try:
+            return int(out_time_ms) / 1_000
+        except ValueError:
+            return None
+
+    return None
+
+
 class _NumericItem(QTableWidgetItem):
     """QTableWidgetItem that sorts numerically (used for the raw-byte size column)."""
 
@@ -95,7 +134,7 @@ def _recommended_output_path(path: str, recommended_label: str) -> str:
 
 
 class _ConversionThread(QThread):
-    progress = Signal(str)
+    progress = Signal(str, int, int, object)
     finished = Signal(bool, str)
 
     def __init__(self, jobs: list[tuple[str, str]], parent=None):
@@ -103,15 +142,26 @@ class _ConversionThread(QThread):
         self._jobs = jobs
 
     def run(self):
-        for source_path, output_path in self._jobs:
+        total_jobs = len(self._jobs)
+
+        for job_index, (source_path, output_path) in enumerate(self._jobs, start=1):
             probe_info = codec_probe.probe_media_info(source_path) or {}
             codec_name = (probe_info.get("video_codec") or "").lower()
             _status, recommended_label, _reason = codec_probe.recommendation(codec_name)
             ffmpeg_args = _recommended_ffmpeg_args(recommended_label)
+            duration_seconds = probe_info.get("duration")
+            if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+                duration_seconds = None
 
             command = [
                 "ffmpeg",
                 "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-progress",
+                "pipe:1",
+                "-nostats",
                 "-i",
                 source_path,
                 "-map",
@@ -125,23 +175,67 @@ class _ConversionThread(QThread):
             ]
 
             try:
-                result = subprocess.run(command, capture_output=True, text=True)
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
             except FileNotFoundError:
                 self.finished.emit(False, "ffmpeg was not found in PATH.")
                 return
+            except OSError as exc:
+                self.finished.emit(False, str(exc))
+                return
 
-            if result.returncode != 0:
-                details = result.stderr.strip() or result.stdout.strip() or f"ffmpeg failed for {os.path.basename(source_path)}"
+            self.progress.emit(source_path, job_index - 1, total_jobs, 0 if duration_seconds else None)
+
+            progress_data: dict[str, str] = {}
+            last_emitted_percent: int | None = 0 if duration_seconds else None
+
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                progress_data[key] = value
+
+                if key != "progress" or not duration_seconds:
+                    continue
+
+                current_seconds = _ffmpeg_progress_seconds(progress_data)
+                if current_seconds is None:
+                    continue
+
+                percent = max(0, min(100, int((current_seconds / duration_seconds) * 100)))
+                if percent != last_emitted_percent:
+                    self.progress.emit(source_path, job_index - 1, total_jobs, percent)
+                    last_emitted_percent = percent
+
+            stderr_output = ""
+            if process.stderr is not None:
+                stderr_output = process.stderr.read().strip()
+
+            return_code = process.wait()
+
+            if return_code != 0:
+                details = stderr_output or f"ffmpeg failed for {os.path.basename(source_path)}"
                 self.finished.emit(False, details)
                 return
 
-            self.progress.emit(output_path)
+            if duration_seconds and last_emitted_percent != 100:
+                self.progress.emit(source_path, job_index - 1, total_jobs, 100)
 
-        self.finished.emit(True, f"Converted {len(self._jobs)} file(s).")
+        self.finished.emit(True, f"Converted {total_jobs} file(s).")
 
 
 class MediaPanel(QWidget):
     """A table that lists media files of one type."""
+
+    conversion_status_changed = Signal(str, bool)
 
     def __init__(self, media_type: str, parent=None):
         super().__init__(parent)
@@ -372,10 +466,17 @@ class MediaPanel(QWidget):
         self._conversion_thread.progress.connect(self._on_conversion_progress)
         self._conversion_thread.finished.connect(self._on_conversion_finished)
         self._label.setText(f"Converting {len(jobs)} file(s)...")
+        self.conversion_status_changed.emit(f"Converting {len(jobs)} file(s)...", True)
         self._conversion_thread.start()
 
-    def _on_conversion_progress(self, output_path: str):
-        self._label.setText(f"Created {os.path.basename(output_path)}")
+    def _on_conversion_progress(self, source_path: str, completed_jobs: int, total_jobs: int, percent: object):
+        current_job = min(total_jobs, completed_jobs + 1)
+        status_text = f"Converting {current_job}/{total_jobs}: {os.path.basename(source_path)}"
+        if isinstance(percent, int):
+            status_text = f"{status_text} ({percent}%)"
+
+        self._label.setText(status_text)
+        self.conversion_status_changed.emit(status_text, True)
 
     def _on_conversion_finished(self, success: bool, message: str):
         if self._conversion_thread is not None:
@@ -384,6 +485,7 @@ class MediaPanel(QWidget):
 
         self._update_label()
         self._refresh_video_controls()
+        self.conversion_status_changed.emit(message, False)
 
         if success:
             QMessageBox.information(self, "Convert selected", message)
