@@ -109,9 +109,12 @@ def probe_media_info(path: str) -> dict | None:
                 path,
             ],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
+        if not result.stdout:
+            return None
         data = json.loads(result.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
         return None
