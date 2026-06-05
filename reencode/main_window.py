@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 from reencode import codec_probe
 from reencode.constants import MEDIA_TYPES
 from reencode.media_panel import MediaPanel
+from reencode.probe_cache import ProbeCache
 from reencode.scanner import ScannerThread
 from reencode.sources_panel import SourcesPanel
 
@@ -23,6 +24,7 @@ class _ProbeThread(QThread):
         self._scan_token = scan_token
         self._jobs = jobs
         self._cancelled = False
+        self._cache = ProbeCache()
 
     def cancel(self):
         self._cancelled = True
@@ -35,11 +37,17 @@ class _ProbeThread(QThread):
             if self._cancelled:
                 break
 
-            probe_info = codec_probe.probe_media_info(path)
+            probe_info = self._cache.get_valid_probe(path)
+            if probe_info is None:
+                probe_info = codec_probe.probe_media_info(path)
+                if probe_info is not None:
+                    self._cache.upsert_probe(path, probe_info)
+
             self.file_ready.emit(self._scan_token, path, probe_info)
             completed += 1
             self.progress.emit(self._scan_token, completed, total)
 
+        self._cache.save()
         self.completed.emit(self._scan_token, completed)
 
 
