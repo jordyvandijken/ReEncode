@@ -242,6 +242,7 @@ class MediaPanel(QWidget):
         self._media_type = media_type
         self._is_video = media_type == "Videos"
         self._conversion_thread: _ConversionThread | None = None
+        self._path_items: dict[str, list[QTableWidgetItem]] = {}
         self._suspend_check_updates = False
         self._setup_ui()
 
@@ -384,6 +385,13 @@ class MediaPanel(QWidget):
         return jobs
 
     def _row_for_path(self, path: str) -> int | None:
+        cached_items = self._path_items.get(path)
+        while cached_items:
+            row = cached_items[0].row()
+            if row >= 0:
+                return row
+            cached_items.pop(0)
+
         for row in range(self._table.rowCount()):
             path_item = self._table.item(row, VCOL_PATH if self._is_video else COL_PATH)
             if path_item is not None and path_item.text() == path:
@@ -492,7 +500,7 @@ class MediaPanel(QWidget):
         else:
             QMessageBox.warning(self, "Convert selected", message[:1000])
 
-    def add_file(self, path: str):
+    def add_file(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
         # Disable sorting while inserting to avoid row-index shifting
         self._table.setSortingEnabled(False)
         self._suspend_check_updates = True
@@ -501,14 +509,12 @@ class MediaPanel(QWidget):
         self._table.insertRow(row)
 
         name = os.path.basename(path)
-
-        try:
-            stat = os.stat(path)
-            size_bytes = stat.st_size
-            modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-        except OSError:
-            size_bytes = 0
-            modified = "—"
+        modified = "—"
+        if modified_timestamp:
+            try:
+                modified = datetime.fromtimestamp(int(modified_timestamp)).strftime("%Y-%m-%d %H:%M")
+            except (OverflowError, ValueError):
+                modified = "—"
 
         name_item = QTableWidgetItem(name)
         name_item.setToolTip(path)
@@ -518,6 +524,7 @@ class MediaPanel(QWidget):
         size_item.setData(Qt.ItemDataRole.UserRole, size_bytes)
 
         path_item = QTableWidgetItem(path)
+        self._path_items.setdefault(path, []).append(path_item)
         modified_item = QTableWidgetItem(modified)
 
         if self._is_video:
@@ -579,6 +586,7 @@ class MediaPanel(QWidget):
 
     def clear(self):
         self._suspend_check_updates = True
+        self._path_items.clear()
         self._table.setRowCount(0)
         self._suspend_check_updates = False
         self._update_label()

@@ -1,3 +1,6 @@
+import os
+from queue import Queue
+
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QTabWidget, QStatusBar,
@@ -40,6 +43,46 @@ class _ProbeThread(QThread):
         self.completed.emit(self._scan_token, completed)
 
 
+class _MetadataThread(QThread):
+    file_ready = Signal(int, str, str, object, str)
+    completed = Signal(int)
+
+    def __init__(self, scan_token: int, parent=None):
+        super().__init__(parent)
+        self._scan_token = scan_token
+        self._jobs: Queue[tuple[str, str] | None] = Queue()
+        self._cancelled = False
+
+    def submit(self, media_type: str, path: str):
+        self._jobs.put((media_type, path))
+
+    def finish(self):
+        self._jobs.put(None)
+
+    def cancel(self):
+        self._cancelled = True
+        self._jobs.put(None)
+
+    def run(self):
+        while True:
+            job = self._jobs.get()
+            if job is None or self._cancelled:
+                break
+
+            media_type, path = job
+            try:
+                stat = os.stat(path)
+                size_bytes = stat.st_size
+                modified = str(int(stat.st_mtime))
+            except OSError:
+                size_bytes = 0
+                modified = ""
+
+            self.file_ready.emit(self._scan_token, media_type, path, size_bytes, modified)
+
+        self.completed.emit(self._scan_token)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -47,10 +90,13 @@ class MainWindow(QMainWindow):
         self.resize(1100, 650)
 
         self._scanner: ScannerThread | None = None
+        self._metadata_thread: _MetadataThread | None = None
         self._probe_thread: _ProbeThread | None = None
         self._scan_token = 0
         self._total_found = 0
+        self._discovery_count: int | None = None
         self._probe_jobs: list[tuple[str, str]] = []
+        self._probe_media_types: dict[str, str] = {}
 
         self._setup_ui()
 
@@ -95,6 +141,10 @@ class MainWindow(QMainWindow):
             self._scanner.cancel()
             self._scanner.wait()
 
+        if self._metadata_thread and self._metadata_thread.isRunning():
+            self._metadata_thread.cancel()
+            self._metadata_thread.wait()
+
         if self._probe_thread and self._probe_thread.isRunning():
             self._probe_thread.cancel()
 
@@ -103,9 +153,16 @@ class MainWindow(QMainWindow):
             panel.clear()
 
         self._total_found = 0
+        self._discovery_count = None
         self._probe_jobs = []
+        self._probe_media_types = {}
         self._sources_panel.set_scanning(True)
         self._status_bar.showMessage("Scanning…")
+
+        self._metadata_thread = _MetadataThread(self._scan_token, parent=self)
+        self._metadata_thread.file_ready.connect(self._on_metadata_ready)
+        self._metadata_thread.completed.connect(self._on_metadata_completed)
+        self._metadata_thread.start()
 
         self._scanner = ScannerThread(folders, MEDIA_TYPES, parent=self)
         self._scanner.file_found.connect(self._on_file_found)
@@ -113,20 +170,56 @@ class MainWindow(QMainWindow):
         self._scanner.start()
 
     def _on_file_found(self, media_type: str, path: str):
+        if self._metadata_thread is not None:
+            self._metadata_thread.submit(media_type, path)
+
+        self._total_found += 1
+        if media_type in {"Videos", "Audio"}:
+            self._probe_jobs.append((media_type, path))
+            self._probe_media_types[path] = media_type
+        if self._total_found % 25 == 0:
+            self._status_bar.showMessage(f"Scanning… {self._total_found} files found so far")
+
+    def _on_metadata_ready(self, scan_token: int, media_type: str, path: str, size_bytes: int, modified_timestamp: str):
+        if scan_token != self._scan_token:
+            return
+
         panel = self._panels.get(media_type)
         if panel:
-            panel.add_file(path)
-            self._total_found += 1
-            if media_type in {"Videos", "Audio"}:
-                self._probe_jobs.append((media_type, path))
-            # Update status bar periodically (every 25 files) to avoid UI churn
-            if self._total_found % 25 == 0:
-                self._status_bar.showMessage(f"Scanning… {self._total_found} files found so far")
+            panel.add_file(path, size_bytes, modified_timestamp)
 
     def _on_discovery_finished(self, count: int):
         if self._scanner is not None:
             self._scanner.deleteLater()
             self._scanner = None
+
+        self._discovery_count = count
+
+        if self._metadata_thread is not None:
+            noun = "file" if count == 1 else "files"
+            self._status_bar.showMessage(f"Discovery complete — finalizing {count} {noun}…")
+            self._metadata_thread.finish()
+            return
+
+        self._begin_probe_phase()
+
+    def _on_metadata_completed(self, scan_token: int):
+        sender = self.sender()
+        if isinstance(sender, _MetadataThread):
+            sender.deleteLater()
+
+        if scan_token != self._scan_token:
+            return
+
+        self._metadata_thread = None
+        self._begin_probe_phase()
+
+    def _begin_probe_phase(self):
+        if self._discovery_count is None:
+            return
+
+        count = self._discovery_count
+        self._discovery_count = None
 
         noun = "file" if count == 1 else "files"
         if not self._probe_jobs:
@@ -145,7 +238,7 @@ class MainWindow(QMainWindow):
         if scan_token != self._scan_token:
             return
 
-        media_type = next((kind for kind, job_path in self._probe_jobs if job_path == path), None)
+        media_type = self._probe_media_types.get(path)
         if media_type is None:
             return
 
@@ -155,6 +248,9 @@ class MainWindow(QMainWindow):
 
     def _on_probe_progress(self, scan_token: int, completed: int, total: int):
         if scan_token != self._scan_token:
+            return
+
+        if completed % 25 != 0 and completed != total:
             return
 
         self._status_bar.showMessage(f"Probing encodings… {completed}/{total} files analyzed")
@@ -189,6 +285,9 @@ class MainWindow(QMainWindow):
         if self._scanner and self._scanner.isRunning():
             self._scanner.cancel()
             self._scanner.wait()
+        if self._metadata_thread and self._metadata_thread.isRunning():
+            self._metadata_thread.cancel()
+            self._metadata_thread.wait()
         if self._probe_thread and self._probe_thread.isRunning():
             self._probe_thread.cancel()
             self._probe_thread.wait()
