@@ -658,6 +658,18 @@ class MediaPanel(QWidget):
             self._refresh_video_controls()
 
     def update_probe(self, path: str, probe_info: dict | None):
+        self.update_probes([(path, probe_info)])
+
+    def update_probes(self, updates: list[tuple[str, dict | None]]):
+        if not updates:
+            return
+
+        self._table.setSortingEnabled(False)
+        for path, probe_info in updates:
+            self._apply_probe_update(path, probe_info)
+        self._table.setSortingEnabled(True)
+
+    def _apply_probe_update(self, path: str, probe_info: dict | None):
         row = self._row_for_path(path)
         if row is None:
             return

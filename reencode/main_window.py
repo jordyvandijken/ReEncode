@@ -107,12 +107,17 @@ class MainWindow(QMainWindow):
         self._discovery_count: int | None = None
         self._probe_jobs: list[tuple[str, str]] = []
         self._probe_media_types: dict[str, str] = {}
+        self._pending_probe_updates: dict[str, dict | None] = {}
         self._pending_metadata_rows: dict[str, list[tuple[str, int, str]]] = {}
         self._metadata_processed = 0
 
         self._metadata_flush_timer = QTimer(self)
         self._metadata_flush_timer.setInterval(30)
         self._metadata_flush_timer.timeout.connect(self._flush_metadata_rows)
+
+        self._probe_flush_timer = QTimer(self)
+        self._probe_flush_timer.setInterval(30)
+        self._probe_flush_timer.timeout.connect(self._flush_probe_updates)
 
         self._setup_ui()
 
@@ -154,6 +159,8 @@ class MainWindow(QMainWindow):
 
         if self._metadata_flush_timer.isActive():
             self._metadata_flush_timer.stop()
+        if self._probe_flush_timer.isActive():
+            self._probe_flush_timer.stop()
 
         # Stop any running scan first
         if self._scanner and self._scanner.isRunning():
@@ -175,6 +182,7 @@ class MainWindow(QMainWindow):
         self._discovery_count = None
         self._probe_jobs = []
         self._probe_media_types = {}
+        self._pending_probe_updates = {}
         self._pending_metadata_rows = {}
         self._metadata_processed = 0
         self._sources_panel.set_scanning(True)
@@ -309,13 +317,36 @@ class MainWindow(QMainWindow):
         if scan_token != self._scan_token:
             return
 
-        media_type = self._probe_media_types.get(path)
-        if media_type is None:
+        self._pending_probe_updates[path] = probe_info
+        if not self._probe_flush_timer.isActive():
+            self._probe_flush_timer.start()
+
+    def _flush_probe_updates(self, limit: int = 250):
+        if not self._pending_probe_updates:
+            if self._probe_flush_timer.isActive():
+                self._probe_flush_timer.stop()
             return
 
-        panel = self._panels.get(media_type)
-        if panel:
-            panel.update_probe(path, probe_info)
+        per_media: dict[str, list[tuple[str, dict | None]]] = {}
+
+        count = 0
+        for path, probe_info in list(self._pending_probe_updates.items()):
+            media_type = self._probe_media_types.get(path)
+            if media_type is not None:
+                per_media.setdefault(media_type, []).append((path, probe_info))
+
+            del self._pending_probe_updates[path]
+            count += 1
+            if count >= limit:
+                break
+
+        for media_type, updates in per_media.items():
+            panel = self._panels.get(media_type)
+            if panel:
+                panel.update_probes(updates)
+
+        if not self._pending_probe_updates and self._probe_flush_timer.isActive():
+            self._probe_flush_timer.stop()
 
     def _on_probe_progress(self, scan_token: int, completed: int, total: int):
         if scan_token != self._scan_token:
@@ -336,6 +367,10 @@ class MainWindow(QMainWindow):
 
         if self._probe_thread is not None:
             self._probe_thread = None
+
+        if self._probe_flush_timer.isActive():
+            self._probe_flush_timer.stop()
+        self._flush_probe_updates(limit=0)
 
         self._sources_panel.set_scanning(False)
         noun = "file" if self._total_found == 1 else "files"
@@ -362,4 +397,6 @@ class MainWindow(QMainWindow):
         if self._probe_thread and self._probe_thread.isRunning():
             self._probe_thread.cancel()
             self._probe_thread.wait()
+        if self._probe_flush_timer.isActive():
+            self._probe_flush_timer.stop()
         super().closeEvent(event)
