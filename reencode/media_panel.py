@@ -273,6 +273,7 @@ class MediaPanel(QWidget):
         self._is_video = media_type == "Videos"
         self._conversion_thread: _ConversionThread | None = None
         self._probe_updates_active = False
+        self._scan_locked = False
         self._path_rows: dict[str, int] = {}
         self._suspend_check_updates = False
         self._setup_ui()
@@ -396,8 +397,10 @@ class MediaPanel(QWidget):
         finally:
             self._suspend_check_updates = False
 
-        self._convert_button.setEnabled(selected > 0 and self._conversion_thread is None)
-        self._do_not_replace.setEnabled(total > 0 and self._conversion_thread is None)
+        enabled = not self._scan_locked and self._conversion_thread is None
+        self._convert_button.setEnabled(selected > 0 and enabled)
+        self._do_not_replace.setEnabled(total > 0 and enabled)
+        self._select_all.setEnabled(total > 0 and enabled)
         self._update_label()
 
     def _selected_row_count(self) -> int:
@@ -699,7 +702,7 @@ class MediaPanel(QWidget):
 
         self._table.setUpdatesEnabled(False)
         try:
-            for path, probe_info in updates:
+            for path, probe_info in self._prioritize_updates(updates):
                 self._apply_probe_update(path, probe_info)
         finally:
             self._table.setUpdatesEnabled(True)
@@ -741,6 +744,30 @@ class MediaPanel(QWidget):
     def file_count(self) -> int:
         return self._table.rowCount()
 
+    def set_scan_locked(self, locked: bool):
+        self._scan_locked = locked
+        if self._is_video:
+            self._refresh_video_controls()
+
+    def _is_row_visible(self, row: int) -> bool:
+        top = self._table.rowViewportPosition(row)
+        if top < 0:
+            return False
+        bottom = top + self._table.rowHeight(row)
+        viewport_height = self._table.viewport().height()
+        return bottom >= 0 and top <= viewport_height
+
+    def _prioritize_updates(self, updates: list[tuple[str, dict | None]]) -> list[tuple[str, dict | None]]:
+        visible: list[tuple[str, dict | None]] = []
+        hidden: list[tuple[str, dict | None]] = []
+        for path, probe_info in updates:
+            row = self._row_for_path(path)
+            if row is not None and self._is_row_visible(row):
+                visible.append((path, probe_info))
+            else:
+                hidden.append((path, probe_info))
+        return visible + hidden
+
     def _update_label(self):
         count = self._table.rowCount()
         if count == 0:
@@ -752,3 +779,61 @@ class MediaPanel(QWidget):
                 self._label.setText(f"{count} {noun} ({selected} selected)")
             else:
                 self._label.setText(f"{count} {noun}")
+
+
+class FailedPanel(QWidget):
+    """Simple table for scan failures."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        self._label = QLabel("No failures.")
+        layout.addWidget(self._label)
+
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(["Name", "Reason", "Absolute Path"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(False)
+        layout.addWidget(self._table)
+
+    def add_failures(self, rows: list[tuple[str, str, str]]):
+        if not rows:
+            return
+
+        self._table.setUpdatesEnabled(False)
+        try:
+            for name, reason, absolute_path in rows:
+                row = self._table.rowCount()
+                self._table.insertRow(row)
+                self._table.setItem(row, 0, QTableWidgetItem(name))
+                self._table.setItem(row, 1, QTableWidgetItem(reason))
+                self._table.setItem(row, 2, QTableWidgetItem(absolute_path))
+        finally:
+            self._table.setUpdatesEnabled(True)
+        self._table.viewport().update()
+        self._update_label()
+
+    def clear(self):
+        self._table.setRowCount(0)
+        self._update_label()
+
+    def file_count(self) -> int:
+        return self._table.rowCount()
+
+    def _update_label(self):
+        count = self._table.rowCount()
+        if count == 0:
+            self._label.setText("No failures.")
+            return
+        noun = "item" if count == 1 else "items"
+        self._label.setText(f"{count} failed {noun}")
