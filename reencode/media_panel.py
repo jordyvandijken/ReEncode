@@ -334,6 +334,8 @@ class MediaPanel(QWidget):
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
+        # Keep path data in the model for internal lookups, but hide it from the UI.
+        self._table.setColumnHidden(VCOL_PATH if self._is_video else COL_PATH, True)
         if self._is_video:
             self._table.itemChanged.connect(self._on_table_item_changed)
         layout.addWidget(self._table)
@@ -450,6 +452,27 @@ class MediaPanel(QWidget):
             codec_text = "Probing..."
             status, rec_label, reason = "pending", "Pending probe", "Codec details will appear after the async probe phase."
 
+        if probe_info is None:
+            estimate_item = _NumericItem("Pending probe", -1)
+            estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            estimate_item.setToolTip("Estimate appears after probe completes.")
+            codec_item = QTableWidgetItem(codec_text)
+
+            rec_item = QTableWidgetItem(rec_label)
+            rec_item.setToolTip(reason)
+            color = {
+                "optimal": _COLOR_OPTIMAL,
+                "good": _COLOR_GOOD,
+                "pending": _COLOR_PENDING,
+            }.get(status, _COLOR_REENCODE)
+            rec_item.setForeground(color)
+            rec_item.setFont(_bold_font(rec_item.font()))
+
+            for item in (codec_item, rec_item):
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            return codec_item, rec_item, estimate_item
+
         estimate_bytes, savings_ratio = size_estimator.estimate_output(
             size_bytes,
             self._media_type,
@@ -481,6 +504,12 @@ class MediaPanel(QWidget):
         return codec_item, rec_item, estimate_item
 
     def _audio_estimate_item(self, path: str, size_bytes: int, probe_info: dict | None):
+        if self._media_type.lower() == "audio" and probe_info is None:
+            estimate_item = _NumericItem("Pending probe", -1)
+            estimate_item.setToolTip("Estimate appears after probe completes.")
+            estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            return estimate_item
+
         estimate_bytes, savings_ratio = size_estimator.estimate_output(
             size_bytes,
             self._media_type,
@@ -546,11 +575,7 @@ class MediaPanel(QWidget):
         else:
             QMessageBox.warning(self, "Convert selected", message[:1000])
 
-    def add_file(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
-        # Disable sorting while inserting to avoid row-index shifting
-        self._table.setSortingEnabled(False)
-        self._suspend_check_updates = True
-
+    def _insert_file_row(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
         row = self._table.rowCount()
         self._table.insertRow(row)
 
@@ -584,13 +609,13 @@ class MediaPanel(QWidget):
             for item in (name_item, size_item, codec_item, rec_item, estimate_item, path_item, modified_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            self._table.setItem(row, VCOL_SELECT,   select_item)
-            self._table.setItem(row, VCOL_NAME,     name_item)
-            self._table.setItem(row, VCOL_SIZE,     size_item)
-            self._table.setItem(row, VCOL_CODEC,    codec_item)
-            self._table.setItem(row, VCOL_REC,      rec_item)
+            self._table.setItem(row, VCOL_SELECT, select_item)
+            self._table.setItem(row, VCOL_NAME, name_item)
+            self._table.setItem(row, VCOL_SIZE, size_item)
+            self._table.setItem(row, VCOL_CODEC, codec_item)
+            self._table.setItem(row, VCOL_REC, rec_item)
             self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
-            self._table.setItem(row, VCOL_PATH,     path_item)
+            self._table.setItem(row, VCOL_PATH, path_item)
             self._table.setItem(row, VCOL_MODIFIED, modified_item)
         else:
             estimate_item = self._audio_estimate_item(path, size_bytes, None)
@@ -598,11 +623,33 @@ class MediaPanel(QWidget):
             for item in (name_item, size_item, estimate_item, path_item, modified_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            self._table.setItem(row, COL_NAME,     name_item)
-            self._table.setItem(row, COL_SIZE,     size_item)
+            self._table.setItem(row, COL_NAME, name_item)
+            self._table.setItem(row, COL_SIZE, size_item)
             self._table.setItem(row, COL_ESTIMATE, estimate_item)
-            self._table.setItem(row, COL_PATH,     path_item)
+            self._table.setItem(row, COL_PATH, path_item)
             self._table.setItem(row, COL_MODIFIED, modified_item)
+
+    def add_file(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
+        # Disable sorting while inserting to avoid row-index shifting
+        self._table.setSortingEnabled(False)
+        self._suspend_check_updates = True
+
+        self._insert_file_row(path, size_bytes, modified_timestamp)
+
+        self._suspend_check_updates = False
+        self._table.setSortingEnabled(True)
+        self._update_label()
+        if self._is_video:
+            self._refresh_video_controls()
+
+    def add_files(self, rows: list[tuple[str, int, str]]):
+        if not rows:
+            return
+
+        self._table.setSortingEnabled(False)
+        self._suspend_check_updates = True
+        for path, size_bytes, modified_timestamp in rows:
+            self._insert_file_row(path, size_bytes, modified_timestamp)
 
         self._suspend_check_updates = False
         self._table.setSortingEnabled(True)

@@ -1,7 +1,7 @@
 import os
 from queue import Queue
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QTabWidget, QStatusBar,
 )
@@ -24,12 +24,14 @@ class _ProbeThread(QThread):
         self._scan_token = scan_token
         self._jobs = jobs
         self._cancelled = False
-        self._cache = ProbeCache()
+        self._cache: ProbeCache | None = None
 
     def cancel(self):
         self._cancelled = True
 
     def run(self):
+        # Load cache inside worker thread to avoid blocking the UI thread.
+        self._cache = ProbeCache()
         total = len(self._jobs)
         completed = 0
 
@@ -105,6 +107,12 @@ class MainWindow(QMainWindow):
         self._discovery_count: int | None = None
         self._probe_jobs: list[tuple[str, str]] = []
         self._probe_media_types: dict[str, str] = {}
+        self._pending_metadata_rows: dict[str, list[tuple[str, int, str]]] = {}
+        self._metadata_processed = 0
+
+        self._metadata_flush_timer = QTimer(self)
+        self._metadata_flush_timer.setInterval(30)
+        self._metadata_flush_timer.timeout.connect(self._flush_metadata_rows)
 
         self._setup_ui()
 
@@ -144,6 +152,9 @@ class MainWindow(QMainWindow):
     def _start_scan(self, folders: list[str]):
         self._scan_token += 1
 
+        if self._metadata_flush_timer.isActive():
+            self._metadata_flush_timer.stop()
+
         # Stop any running scan first
         if self._scanner and self._scanner.isRunning():
             self._scanner.cancel()
@@ -164,6 +175,8 @@ class MainWindow(QMainWindow):
         self._discovery_count = None
         self._probe_jobs = []
         self._probe_media_types = {}
+        self._pending_metadata_rows = {}
+        self._metadata_processed = 0
         self._sources_panel.set_scanning(True)
         self._status_bar.showMessage("Scanning…")
 
@@ -192,9 +205,11 @@ class MainWindow(QMainWindow):
         if scan_token != self._scan_token:
             return
 
-        panel = self._panels.get(media_type)
-        if panel:
-            panel.add_file(path, size_bytes, modified_timestamp)
+        self._pending_metadata_rows.setdefault(media_type, []).append((path, size_bytes, modified_timestamp))
+        self._metadata_processed += 1
+
+        if not self._metadata_flush_timer.isActive():
+            self._metadata_flush_timer.start()
 
     def _on_discovery_finished(self, count: int):
         if self._scanner is not None:
@@ -204,8 +219,7 @@ class MainWindow(QMainWindow):
         self._discovery_count = count
 
         if self._metadata_thread is not None:
-            noun = "file" if count == 1 else "files"
-            self._status_bar.showMessage(f"Discovery complete — finalizing {count} {noun}…")
+            self._update_metadata_status()
             self._metadata_thread.finish()
             return
 
@@ -219,8 +233,57 @@ class MainWindow(QMainWindow):
         if scan_token != self._scan_token:
             return
 
+        if self._metadata_flush_timer.isActive():
+            self._metadata_flush_timer.stop()
+        self._flush_metadata_rows(limit=0)
+
         self._metadata_thread = None
         self._begin_probe_phase()
+
+    def _flush_metadata_rows(self, limit: int = 250):
+        total_added = 0
+
+        for media_type, rows in self._pending_metadata_rows.items():
+            if not rows:
+                continue
+
+            panel = self._panels.get(media_type)
+            if panel is None:
+                rows.clear()
+                continue
+
+            if limit == 0:
+                take = len(rows)
+            else:
+                remaining = limit - total_added
+                if remaining <= 0:
+                    break
+                take = min(remaining, len(rows))
+
+            batch = rows[:take]
+            del rows[:take]
+            panel.add_files(batch)
+            total_added += take
+
+        if total_added:
+            self._update_metadata_status()
+
+        if self._metadata_thread is not None:
+            has_pending = any(rows for rows in self._pending_metadata_rows.values())
+            if has_pending and not self._metadata_flush_timer.isActive():
+                self._metadata_flush_timer.start()
+            elif not has_pending and self._metadata_flush_timer.isActive():
+                self._metadata_flush_timer.stop()
+
+    def _update_metadata_status(self):
+        if self._discovery_count is None:
+            self._status_bar.showMessage(f"Finalizing file list… {self._metadata_processed} files prepared")
+            return
+
+        total = max(1, self._discovery_count)
+        processed = min(self._metadata_processed, self._discovery_count)
+        percent = int((processed / total) * 100)
+        self._status_bar.showMessage(f"Finalizing file list… {processed}/{self._discovery_count} ({percent}%)")
 
     def _begin_probe_phase(self):
         if self._discovery_count is None:
