@@ -119,6 +119,50 @@ class MetadataProbeWorkerTests(unittest.TestCase):
             self.assertEqual(probed, 0)
             self.assertTrue(fake_store.committed)
 
+    def test_cancel_stops_processing_remaining_queued_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir(parents=True, exist_ok=True)
+            first = root / "first.mp4"
+            second = root / "second.mp4"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+
+            worker = _MetadataProbeWorker(
+                scan_id=9,
+                store_path=str(Path(tmp) / "scan.db"),
+                source_roots=[str(root)],
+            )
+
+            row_payloads: list[tuple] = []
+            completed_payloads: list[tuple[int, str, bool, int, int]] = []
+
+            def _on_row_ready(*args):
+                row_payloads.append(args)
+                if len(row_payloads) == 1:
+                    worker.cancel()
+
+            worker.row_ready.connect(_on_row_ready)
+            worker.completed.connect(lambda *args: completed_payloads.append(args))
+
+            worker.submit("Videos", str(first))
+            worker.submit("Videos", str(second))
+            worker.finish(expected_total=2)
+
+            with mock.patch(
+                "reencode.codec_probe.probe_media_info",
+                return_value={"video_codec": "h264", "duration": 1.0},
+            ):
+                worker.run()
+
+            self.assertEqual(len(row_payloads), 1)
+            self.assertEqual(len(completed_payloads), 1)
+            scan_id, phase, cancelled, processed, _probed = completed_payloads[0]
+            self.assertEqual(scan_id, 9)
+            self.assertEqual(phase, "metadata")
+            self.assertTrue(cancelled)
+            self.assertEqual(processed, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,9 @@ class _MetadataProbeWorker(QThread):
         store = ScanStore(db_path=Path(self._store_path))
         try:
             while True:
+                if self._cancelled:
+                    break
+
                 job = self._jobs.get()
                 if job is None:
                     if self._cancelled:
@@ -80,6 +83,9 @@ class _MetadataProbeWorker(QThread):
                     if self._input_closed and self._jobs.empty():
                         break
                     continue
+
+                if self._cancelled:
+                    break
 
                 media_type, path = job
                 try:

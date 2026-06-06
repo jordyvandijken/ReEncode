@@ -232,6 +232,100 @@ class MainWindowScanContractTests(unittest.TestCase):
         self.assertEqual(worker.expected_total, 2)
         self.assertTrue(worker.started)
 
+    def test_scan_lifecycle_finalizes_and_prunes_stale_records(self):
+        class _DummySignal:
+            def connect(self, _slot):
+                return None
+
+        class _DummyWorker:
+            def __init__(self, *args, **kwargs):
+                self.row_ready = _DummySignal()
+                self.failed_item = _DummySignal()
+                self.progress = _DummySignal()
+                self.completed = _DummySignal()
+                self.fatal_error = _DummySignal()
+
+            def submit(self, media_type: str, path: str):
+                return None
+
+            def finish(self, expected_total: int):
+                return None
+
+            def start(self):
+                return None
+
+            def isRunning(self):
+                return False
+
+            def cancel(self):
+                return None
+
+            def wait(self):
+                return True
+
+        root = Path(self._tmp.name) / "source"
+        root.mkdir(parents=True, exist_ok=True)
+        stale_path = str(root / "stale.mp4")
+        fresh_path = str(root / "fresh.mp4")
+
+        self.window._active_source_roots = [str(root)]
+        self.window._scan_store.upsert_record(
+            absolute_path=stale_path,
+            source_root=str(root),
+            media_type="Videos",
+            file_size=123,
+            last_modified=1,
+            scan_id=41,
+        )
+
+        self.window._scan_state = ScanState.QUICKSCAN
+        self.window._on_file_found(scan_token=42, media_type="Videos", path=fresh_path)
+
+        with mock.patch("reencode.main_window._MetadataProbeWorker", _DummyWorker):
+            self.window._on_discovery_finished(
+                scan_token=42,
+                _phase="discovery",
+                count=1,
+                cancelled=False,
+            )
+
+        self.window._on_worker_completed(
+            scan_token=42,
+            _phase="metadata",
+            cancelled=False,
+            processed=1,
+            probed=0,
+        )
+
+        self.assertEqual(self.window._scan_state, ScanState.IDLE)
+        self.assertIsNone(self.window._scan_store.get_record(stale_path))
+        fresh_record = self.window._scan_store.get_record(fresh_path)
+        self.assertIsNotNone(fresh_record)
+        assert fresh_record is not None
+        self.assertEqual(fresh_record["last_scanned"], 42)
+        self.assertEqual(self.window._sources_panel._btn_scan.text(), "Scan")
+        message = self.window._status_bar.currentMessage()
+        self.assertIn("1 file found", message)
+        self.assertIn("1 stale removed", message)
+
+    def test_discovery_cancelled_finalizes_without_worker(self):
+        self.window._scan_state = ScanState.QUICKSCAN
+        self.window._active_source_roots = [self._tmp.name]
+        self.window._sources_panel.set_scanning(True)
+
+        self.window._on_discovery_finished(
+            scan_token=42,
+            _phase="discovery",
+            count=0,
+            cancelled=True,
+        )
+
+        self.assertEqual(self.window._scan_state, ScanState.IDLE)
+        self.assertIsNone(self.window._metadata_probe_worker)
+        self.assertTrue(self.window._worker_cancelled)
+        self.assertEqual(self.window._sources_panel._btn_scan.text(), "Scan")
+        self.assertIn("cancelled", self.window._status_bar.currentMessage())
+
 
 if __name__ == "__main__":
     unittest.main()
