@@ -1,6 +1,7 @@
 import os
 from queue import Queue
 from time import perf_counter
+import math
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, Signal, QTimer
@@ -231,6 +232,8 @@ class MainWindow(QMainWindow):
         self._status_timer.setInterval(100)
         self._status_timer.timeout.connect(self._refresh_scan_status)
 
+        self._scan_started_at: float | None = None
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -307,6 +310,7 @@ class MainWindow(QMainWindow):
         self._pending_failed_rows = []
         self._discovered_files = []
         self._metadata_processed = 0
+        self._scan_started_at = perf_counter()
 
         self._sources_panel.set_scanning(True)
         self._status_bar.showMessage("Scanning…")
@@ -333,7 +337,48 @@ class MainWindow(QMainWindow):
         if self._metadata_probe_worker and self._metadata_probe_worker.isRunning():
             self._metadata_probe_worker.cancel()
 
-        self._status_bar.showMessage("Cancelling scan…")
+        self._status_bar.showMessage(f"Cancelling scan… {self._scan_timing_text()}")
+
+    @staticmethod
+    def _format_duration(seconds: float | None) -> str:
+        if seconds is None or not math.isfinite(seconds) or seconds < 0:
+            return "--:--"
+
+        total_seconds = int(seconds)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:02}:{minutes:02}:{secs:02}"
+        return f"{minutes:02}:{secs:02}"
+
+    def _scan_elapsed_seconds(self) -> float | None:
+        if self._scan_started_at is None:
+            return None
+        return max(0.0, perf_counter() - self._scan_started_at)
+
+    def _scan_timing_text(self, completed: int | None = None, total: int | None = None) -> str:
+        elapsed = self._scan_elapsed_seconds()
+        elapsed_text = self._format_duration(elapsed)
+
+        eta_seconds: float | None = None
+        if (
+            elapsed is not None
+            and elapsed > 0
+            and completed is not None
+            and total is not None
+            and total > 0
+            and completed > 0
+        ):
+            remaining = max(0, total - completed)
+            if remaining == 0:
+                eta_seconds = 0.0
+            else:
+                rate = completed / elapsed
+                if rate > 0:
+                    eta_seconds = remaining / rate
+
+        eta_text = self._format_duration(eta_seconds)
+        return f"{elapsed_text} - {eta_text}"
 
     def _on_file_found(self, scan_token: int, media_type: str, path: str):
         if scan_token != self._scan_token:
@@ -592,17 +637,21 @@ class MainWindow(QMainWindow):
         total = max(1, self._metadata_total or self._discovery_count or self._metadata_processed)
         processed = min(self._metadata_processed, total)
         percent = int((processed / total) * 100)
-        self._status_bar.showMessage(f"Metadata… {processed}/{total} ({percent}%)")
+        self._status_bar.showMessage(
+            f"Metadata… {processed}/{total} ({percent}%) | {self._scan_timing_text(processed, total)}"
+        )
 
     def _refresh_scan_status(self):
         if self._scan_state == ScanState.IDLE:
             return
         if self._cancel_requested:
-            self._status_bar.showMessage("Cancelling scan…")
+            self._status_bar.showMessage(f"Cancelling scan… {self._scan_timing_text()}")
             return
         if self._scan_state == ScanState.QUICKSCAN:
             discovered = max(self._discovery_progress_count, self._total_found)
-            self._status_bar.showMessage(f"Scanning… {discovered} files found so far")
+            self._status_bar.showMessage(
+                f"Scanning… {discovered} files found so far | {self._scan_timing_text()}"
+            )
             return
         self._update_metadata_status()
 
@@ -637,6 +686,7 @@ class MainWindow(QMainWindow):
 
     def _finalize_scan(self, discovered_count: int, probed_count: int):
         pruned = self._scan_store.prune_scan_scope(self._active_source_roots, self._scan_token)
+        elapsed_text = self._format_duration(self._scan_elapsed_seconds())
 
         self._scan_state = ScanState.IDLE
         self._cancel_requested = False
@@ -652,8 +702,10 @@ class MainWindow(QMainWindow):
         cancelled_text = " (cancelled)" if self._worker_cancelled else ""
         self._status_bar.showMessage(
             f"Scan complete{cancelled_text} — {discovered_count} {noun} found, "
-            f"{probed_count} probed, {failed_count} failed, {pruned} stale removed."
+            f"{probed_count} probed, {failed_count} failed, {pruned} stale removed. "
+            f"Time: {elapsed_text}."
         )
+        self._scan_started_at = None
 
     def _on_conversion_status_changed(self, message: str, active: bool):
         if active:
