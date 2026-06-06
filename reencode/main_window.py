@@ -1,5 +1,6 @@
 import os
 from queue import Queue
+from time import perf_counter
 
 from PySide6.QtCore import QThread, Qt, Signal, QTimer
 from PySide6.QtWidgets import (
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
         self._probe_jobs: list[tuple[str, str]] = []
         self._probe_media_types: dict[str, str] = {}
         self._pending_probe_updates: dict[str, dict | None] = {}
+        self._probe_completed_count: int | None = None
         self._pending_metadata_rows: dict[str, list[tuple[str, int, str]]] = {}
         self._metadata_processed = 0
 
@@ -183,6 +185,7 @@ class MainWindow(QMainWindow):
         self._probe_jobs = []
         self._probe_media_types = {}
         self._pending_probe_updates = {}
+        self._probe_completed_count = None
         self._pending_metadata_rows = {}
         self._metadata_processed = 0
         self._sources_panel.set_scanning(True)
@@ -330,10 +333,14 @@ class MainWindow(QMainWindow):
         if not self._pending_probe_updates:
             if self._probe_flush_timer.isActive():
                 self._probe_flush_timer.stop()
+            if self._probe_completed_count is not None:
+                self._finalize_probe_phase(self._probe_completed_count)
             return
 
         per_media: dict[str, list[tuple[str, dict | None]]] = {}
 
+        flush_start = perf_counter()
+        target_limit = limit if limit > 0 else 150
         count = 0
         for path, probe_info in list(self._pending_probe_updates.items()):
             media_type = self._probe_media_types.get(path)
@@ -342,7 +349,10 @@ class MainWindow(QMainWindow):
 
             del self._pending_probe_updates[path]
             count += 1
-            if count >= limit:
+            if count >= target_limit:
+                break
+            elapsed_ms = (perf_counter() - flush_start) * 1000
+            if elapsed_ms >= 16:
                 break
 
         for media_type, updates in per_media.items():
@@ -352,6 +362,8 @@ class MainWindow(QMainWindow):
 
         if not self._pending_probe_updates and self._probe_flush_timer.isActive():
             self._probe_flush_timer.stop()
+        if not self._pending_probe_updates and self._probe_completed_count is not None:
+            self._finalize_probe_phase(self._probe_completed_count)
 
     def _on_probe_progress(self, scan_token: int, completed: int, total: int):
         if scan_token != self._scan_token:
@@ -373,9 +385,15 @@ class MainWindow(QMainWindow):
         if self._probe_thread is not None:
             self._probe_thread = None
 
-        if self._probe_flush_timer.isActive():
-            self._probe_flush_timer.stop()
-        self._flush_probe_updates(limit=0)
+        self._probe_completed_count = completed
+        if self._pending_probe_updates:
+            if not self._probe_flush_timer.isActive():
+                self._probe_flush_timer.start()
+        else:
+            self._finalize_probe_phase(completed)
+
+    def _finalize_probe_phase(self, completed: int):
+        self._probe_completed_count = None
 
         for media_type in {"Videos", "Audio"}:
             panel = self._panels.get(media_type)

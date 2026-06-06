@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -273,7 +273,7 @@ class MediaPanel(QWidget):
         self._is_video = media_type == "Videos"
         self._conversion_thread: _ConversionThread | None = None
         self._probe_updates_active = False
-        self._path_items: dict[str, list[QTableWidgetItem]] = {}
+        self._path_rows: dict[str, int] = {}
         self._suspend_check_updates = False
         self._setup_ui()
 
@@ -430,19 +430,26 @@ class MediaPanel(QWidget):
 
         return jobs
 
-    def _row_for_path(self, path: str) -> int | None:
-        cached_items = self._path_items.get(path)
-        while cached_items:
-            row = cached_items[0].row()
-            if row >= 0:
-                return row
-            cached_items.pop(0)
+    def _path_column(self) -> int:
+        return VCOL_PATH if self._is_video else COL_PATH
 
+    def _rebuild_path_rows(self):
+        self._path_rows.clear()
+        path_col = self._path_column()
         for row in range(self._table.rowCount()):
-            path_item = self._table.item(row, VCOL_PATH if self._is_video else COL_PATH)
+            path_item = self._table.item(row, path_col)
+            if path_item is not None:
+                self._path_rows[path_item.text()] = row
+
+    def _row_for_path(self, path: str) -> int | None:
+        row = self._path_rows.get(path)
+        if row is not None:
+            path_item = self._table.item(row, self._path_column())
             if path_item is not None and path_item.text() == path:
                 return row
-        return None
+
+        self._rebuild_path_rows()
+        return self._path_rows.get(path)
 
     def _video_details_items(self, path: str, size_bytes: int, probe_info: dict | None):
         raw_codec = (probe_info or {}).get("video_codec")
@@ -596,7 +603,6 @@ class MediaPanel(QWidget):
         size_item.setData(Qt.ItemDataRole.UserRole, size_bytes)
 
         path_item = QTableWidgetItem(path)
-        self._path_items.setdefault(path, []).append(path_item)
         modified_item = QTableWidgetItem(modified)
 
         if self._is_video:
@@ -630,6 +636,8 @@ class MediaPanel(QWidget):
             self._table.setItem(row, COL_PATH, path_item)
             self._table.setItem(row, COL_MODIFIED, modified_item)
 
+        self._path_rows[path] = row
+
     def add_file(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
         # Disable sorting while inserting to avoid row-index shifting
         self._table.setSortingEnabled(False)
@@ -639,6 +647,7 @@ class MediaPanel(QWidget):
 
         self._suspend_check_updates = False
         self._table.setSortingEnabled(True)
+        self._rebuild_path_rows()
         self._update_label()
         if self._is_video:
             self._refresh_video_controls()
@@ -654,6 +663,7 @@ class MediaPanel(QWidget):
 
         self._suspend_check_updates = False
         self._table.setSortingEnabled(True)
+        self._rebuild_path_rows()
         self._update_label()
         if self._is_video:
             self._refresh_video_controls()
@@ -665,6 +675,7 @@ class MediaPanel(QWidget):
         if self._probe_updates_active:
             return
 
+        self._rebuild_path_rows()
         # Keep sorting suspended for the entire probe phase to avoid full-table
         # resorting on every small update batch.
         self._probe_updates_active = True
@@ -675,7 +686,7 @@ class MediaPanel(QWidget):
             return
 
         self._probe_updates_active = False
-        self._table.setSortingEnabled(True)
+        QTimer.singleShot(0, lambda: self._table.setSortingEnabled(True))
 
     def update_probes(self, updates: list[tuple[str, dict | None]]):
         if not updates:
@@ -720,7 +731,7 @@ class MediaPanel(QWidget):
 
     def clear(self):
         self._suspend_check_updates = True
-        self._path_items.clear()
+        self._path_rows.clear()
         self._table.setRowCount(0)
         self._suspend_check_updates = False
         self._update_label()
