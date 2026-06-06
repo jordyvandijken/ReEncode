@@ -116,7 +116,7 @@ class MainWindow(QMainWindow):
         self._metadata_flush_timer.timeout.connect(self._flush_metadata_rows)
 
         self._probe_flush_timer = QTimer(self)
-        self._probe_flush_timer.setInterval(30)
+        self._probe_flush_timer.setInterval(50)
         self._probe_flush_timer.timeout.connect(self._flush_probe_updates)
 
         self._setup_ui()
@@ -307,6 +307,11 @@ class MainWindow(QMainWindow):
             return
 
         self._status_bar.showMessage(f"Discovery complete — probing encodings for {len(self._probe_jobs)} files…")
+        for media_type in {"Videos", "Audio"}:
+            panel = self._panels.get(media_type)
+            if panel:
+                panel.begin_probe_updates()
+
         self._probe_thread = _ProbeThread(self._scan_token, list(self._probe_jobs), parent=self)
         self._probe_thread.file_ready.connect(self._on_probe_file_ready)
         self._probe_thread.progress.connect(self._on_probe_progress)
@@ -321,7 +326,7 @@ class MainWindow(QMainWindow):
         if not self._probe_flush_timer.isActive():
             self._probe_flush_timer.start()
 
-    def _flush_probe_updates(self, limit: int = 250):
+    def _flush_probe_updates(self, limit: int = 100):
         if not self._pending_probe_updates:
             if self._probe_flush_timer.isActive():
                 self._probe_flush_timer.stop()
@@ -371,6 +376,11 @@ class MainWindow(QMainWindow):
         if self._probe_flush_timer.isActive():
             self._probe_flush_timer.stop()
         self._flush_probe_updates(limit=0)
+
+        for media_type in {"Videos", "Audio"}:
+            panel = self._panels.get(media_type)
+            if panel:
+                panel.end_probe_updates()
 
         self._sources_panel.set_scanning(False)
         noun = "file" if self._total_found == 1 else "files"

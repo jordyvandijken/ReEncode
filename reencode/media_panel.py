@@ -272,6 +272,7 @@ class MediaPanel(QWidget):
         self._media_type = media_type
         self._is_video = media_type == "Videos"
         self._conversion_thread: _ConversionThread | None = None
+        self._probe_updates_active = False
         self._path_items: dict[str, list[QTableWidgetItem]] = {}
         self._suspend_check_updates = False
         self._setup_ui()
@@ -660,14 +661,42 @@ class MediaPanel(QWidget):
     def update_probe(self, path: str, probe_info: dict | None):
         self.update_probes([(path, probe_info)])
 
+    def begin_probe_updates(self):
+        if self._probe_updates_active:
+            return
+
+        # Keep sorting suspended for the entire probe phase to avoid full-table
+        # resorting on every small update batch.
+        self._probe_updates_active = True
+        self._table.setSortingEnabled(False)
+
+    def end_probe_updates(self):
+        if not self._probe_updates_active:
+            return
+
+        self._probe_updates_active = False
+        self._table.setSortingEnabled(True)
+
     def update_probes(self, updates: list[tuple[str, dict | None]]):
         if not updates:
             return
 
-        self._table.setSortingEnabled(False)
-        for path, probe_info in updates:
-            self._apply_probe_update(path, probe_info)
-        self._table.setSortingEnabled(True)
+        restore_sorting = False
+        if not self._probe_updates_active:
+            self._table.setSortingEnabled(False)
+            restore_sorting = True
+
+        self._table.setUpdatesEnabled(False)
+        try:
+            for path, probe_info in updates:
+                self._apply_probe_update(path, probe_info)
+        finally:
+            self._table.setUpdatesEnabled(True)
+
+        self._table.viewport().update()
+
+        if restore_sorting:
+            self._table.setSortingEnabled(True)
 
     def _apply_probe_update(self, path: str, probe_info: dict | None):
         row = self._row_for_path(path)
