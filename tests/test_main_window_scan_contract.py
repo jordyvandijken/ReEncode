@@ -4,12 +4,14 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
 from reencode.main_window import MainWindow
+from reencode.scan_contracts import ScanState
 from reencode.scan_store import ScanStore
 
 
@@ -87,6 +89,74 @@ class MainWindowScanContractTests(unittest.TestCase):
 
         self.assertFalse(self.window._discovery_finished)
         self.assertEqual(self.window._discovery_count, 0)
+
+    def test_file_found_populates_rows_before_metadata_phase(self):
+        path = str(Path(self._tmp.name) / "video.mp4")
+
+        self.window._on_file_found(
+            scan_token=42,
+            media_type="Videos",
+            path=path,
+        )
+        self.window._flush_metadata_rows(limit=0)
+
+        self.assertEqual(self.window._panels["Videos"].file_count(), 1)
+        self.assertEqual(self.window._scan_state, ScanState.IDLE)
+
+    def test_discovery_finished_starts_metadata_worker_after_discovery(self):
+        class _DummySignal:
+            def connect(self, _slot):
+                return None
+
+        class _DummyWorker:
+            def __init__(self, *args, **kwargs):
+                self.row_ready = _DummySignal()
+                self.failed_item = _DummySignal()
+                self.progress = _DummySignal()
+                self.completed = _DummySignal()
+                self.fatal_error = _DummySignal()
+                self.submitted: list[tuple[str, str]] = []
+                self.expected_total = -1
+                self.started = False
+                self.cancelled = False
+
+            def submit(self, media_type: str, path: str):
+                self.submitted.append((media_type, path))
+
+            def finish(self, expected_total: int):
+                self.expected_total = expected_total
+
+            def start(self):
+                self.started = True
+
+            def isRunning(self):
+                return False
+
+            def cancel(self):
+                self.cancelled = True
+
+            def wait(self):
+                return True
+
+        path_a = str(Path(self._tmp.name) / "a.mp4")
+        path_b = str(Path(self._tmp.name) / "b.mp4")
+        self.window._scan_state = ScanState.QUICKSCAN
+        self.window._discovered_files = [("Videos", path_a), ("Audio", path_b)]
+
+        with mock.patch("reencode.main_window._MetadataProbeWorker", _DummyWorker):
+            self.window._on_discovery_finished(
+                scan_token=42,
+                _phase="discovery",
+                count=2,
+                cancelled=False,
+            )
+
+        worker = self.window._metadata_probe_worker
+        self.assertIsNotNone(worker)
+        self.assertEqual(self.window._scan_state, ScanState.METADATA)
+        self.assertEqual(worker.submitted, [("Videos", path_a), ("Audio", path_b)])
+        self.assertEqual(worker.expected_total, 2)
+        self.assertTrue(worker.started)
 
 
 if __name__ == "__main__":

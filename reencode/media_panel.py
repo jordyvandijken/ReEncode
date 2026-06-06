@@ -591,12 +591,7 @@ class MediaPanel(QWidget):
         self._table.insertRow(row)
 
         name = os.path.basename(path)
-        modified = "—"
-        if modified_timestamp:
-            try:
-                modified = datetime.fromtimestamp(int(modified_timestamp)).strftime("%Y-%m-%d %H:%M")
-            except (OverflowError, ValueError):
-                modified = "—"
+        modified = self._format_modified(modified_timestamp)
 
         name_item = QTableWidgetItem(name)
         name_item.setToolTip(path)
@@ -641,6 +636,15 @@ class MediaPanel(QWidget):
 
         self._path_rows[path] = row
 
+    def _format_modified(self, modified_timestamp: str) -> str:
+        if not modified_timestamp:
+            return "—"
+
+        try:
+            return datetime.fromtimestamp(int(modified_timestamp)).strftime("%Y-%m-%d %H:%M")
+        except (OverflowError, ValueError):
+            return "—"
+
     def add_file(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
         # Disable sorting while inserting to avoid row-index shifting
         self._table.setSortingEnabled(False)
@@ -673,6 +677,46 @@ class MediaPanel(QWidget):
 
     def update_probe(self, path: str, probe_info: dict | None):
         self.update_probes([(path, probe_info)])
+
+    def update_file_stats(self, rows: list[tuple[str, int, str]]):
+        if not rows:
+            return
+
+        restore_sorting = False
+        if not self._probe_updates_active:
+            self._table.setSortingEnabled(False)
+            restore_sorting = True
+
+        self._table.setUpdatesEnabled(False)
+        try:
+            for path, size_bytes, modified_timestamp in rows:
+                row = self._row_for_path(path)
+                if row is None:
+                    continue
+
+                size_item = _NumericItem(_human_size(size_bytes), size_bytes)
+                size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                size_item.setData(Qt.ItemDataRole.UserRole, size_bytes)
+                size_item.setFlags(size_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                modified_item = QTableWidgetItem(self._format_modified(modified_timestamp))
+                modified_item.setFlags(modified_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+                if self._is_video:
+                    self._table.setItem(row, VCOL_SIZE, size_item)
+                    self._table.setItem(row, VCOL_MODIFIED, modified_item)
+                else:
+                    self._table.setItem(row, COL_SIZE, size_item)
+                    self._table.setItem(row, COL_MODIFIED, modified_item)
+                    estimate_item = self._audio_estimate_item(path, size_bytes, None)
+                    self._table.setItem(row, COL_ESTIMATE, estimate_item)
+        finally:
+            self._table.setUpdatesEnabled(True)
+
+        self._table.viewport().update()
+
+        if restore_sorting:
+            self._table.setSortingEnabled(True)
 
     def begin_probe_updates(self):
         if self._probe_updates_active:

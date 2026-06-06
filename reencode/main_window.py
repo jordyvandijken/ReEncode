@@ -187,7 +187,9 @@ class MainWindow(QMainWindow):
         self._worker_processed_count = 0
         self._worker_probed_count = 0
 
+        self._discovered_files: list[tuple[str, str]] = []
         self._pending_metadata_rows: dict[str, list[tuple[str, int, str]]] = {}
+        self._pending_metadata_updates: dict[str, list[tuple[str, int, str]]] = {}
         self._pending_probe_updates: dict[str, tuple[str, dict | None]] = {}
         self._pending_failed_rows: list[tuple[str, str, str]] = []
 
@@ -272,25 +274,16 @@ class MainWindow(QMainWindow):
         self._worker_processed_count = 0
         self._worker_probed_count = 0
         self._pending_metadata_rows = {}
+        self._pending_metadata_updates = {}
         self._pending_probe_updates = {}
         self._pending_failed_rows = []
+        self._discovered_files = []
         self._metadata_processed = 0
 
         self._sources_panel.set_scanning(True)
         self._status_bar.showMessage("Scanning…")
 
-        self._metadata_probe_worker = _MetadataProbeWorker(
-            self._scan_token,
-            str(self._scan_store.db_path),
-            self._active_source_roots,
-            parent=self,
-        )
-        self._metadata_probe_worker.row_ready.connect(self._on_row_ready)
-        self._metadata_probe_worker.failed_item.connect(self._on_failed_item)
-        self._metadata_probe_worker.progress.connect(self._on_worker_progress)
-        self._metadata_probe_worker.completed.connect(self._on_worker_completed)
-        self._metadata_probe_worker.fatal_error.connect(self._on_worker_fatal_error)
-        self._metadata_probe_worker.start()
+        self._metadata_probe_worker = None
 
         self._scanner = ScannerThread(self._scan_token, folders, MEDIA_TYPES, parent=self)
         self._scanner.file_found.connect(self._on_file_found)
@@ -303,8 +296,10 @@ class MainWindow(QMainWindow):
         if scan_token != self._scan_token:
             return
 
-        if self._metadata_probe_worker is not None:
-            self._metadata_probe_worker.submit(media_type, path)
+        self._discovered_files.append((media_type, path))
+        self._pending_metadata_rows.setdefault(media_type, []).append((path, 0, ""))
+        if not self._metadata_flush_timer.isActive():
+            self._metadata_flush_timer.start()
         self._total_found += 1
 
     def _on_discovery_progress(self, scan_token: int, _phase: str, discovered_count: int, _total: int):
@@ -323,11 +318,33 @@ class MainWindow(QMainWindow):
         self._discovery_finished = True
         self._discovery_count = count
 
-        if self._metadata_probe_worker is not None:
-            self._metadata_probe_worker.finish(count)
-
         if cancelled:
             self._worker_cancelled = True
+
+        if cancelled or not self._discovered_files:
+            self._worker_finished = True
+            self._worker_processed_count = 0
+            self._worker_probed_count = 0
+            self._try_finalize_scan()
+            return
+
+        self._scan_state = ScanState.METADATA
+        self._metadata_probe_worker = _MetadataProbeWorker(
+            self._scan_token,
+            str(self._scan_store.db_path),
+            self._active_source_roots,
+            parent=self,
+        )
+        self._metadata_probe_worker.row_ready.connect(self._on_row_ready)
+        self._metadata_probe_worker.failed_item.connect(self._on_failed_item)
+        self._metadata_probe_worker.progress.connect(self._on_worker_progress)
+        self._metadata_probe_worker.completed.connect(self._on_worker_completed)
+        self._metadata_probe_worker.fatal_error.connect(self._on_worker_fatal_error)
+
+        for media_type, path in self._discovered_files:
+            self._metadata_probe_worker.submit(media_type, path)
+        self._metadata_probe_worker.finish(len(self._discovered_files))
+        self._metadata_probe_worker.start()
 
         self._try_finalize_scan()
 
@@ -354,7 +371,7 @@ class MainWindow(QMainWindow):
         if scan_token != self._scan_token:
             return
 
-        self._pending_metadata_rows.setdefault(media_type, []).append((path, int(size_bytes), modified_timestamp))
+        self._pending_metadata_updates.setdefault(media_type, []).append((path, int(size_bytes), modified_timestamp))
         if media_type in {"Videos", "Audio"}:
             self._pending_probe_updates[path] = (media_type, probe_info)
 
@@ -377,9 +394,11 @@ class MainWindow(QMainWindow):
             return
 
         self._metadata_processed = completed
+        if self._worker_finished or self._scan_state != ScanState.METADATA:
+            return
         if completed % 25 != 0 and completed != total:
             return
-        self._status_bar.showMessage(f"{phase.title()}… {completed}/{max(total, 1)} files processed")
+        self._update_metadata_status()
 
     def _on_worker_completed(self, scan_token: int, _phase: str, cancelled: bool, processed: int, probed: int):
         sender = self.sender()
@@ -406,6 +425,7 @@ class MainWindow(QMainWindow):
 
     def _flush_metadata_rows(self, limit: int = 250):
         total_added = 0
+        total_updated = 0
 
         for media_type, rows in self._pending_metadata_rows.items():
             if not rows:
@@ -429,10 +449,35 @@ class MainWindow(QMainWindow):
             panel.add_files(batch)
             total_added += take
 
-        if total_added:
+        for media_type, rows in self._pending_metadata_updates.items():
+            if not rows:
+                continue
+
+            panel = self._panels.get(media_type)
+            if panel is None:
+                rows.clear()
+                continue
+
+            if limit == 0:
+                take = len(rows)
+            else:
+                remaining = limit - total_added
+                if remaining <= 0:
+                    break
+                take = min(remaining, len(rows))
+
+            batch = rows[:take]
+            del rows[:take]
+            panel.update_file_stats(batch)
+            total_updated += take
+            total_added += take
+
+        if total_updated and self._scan_state == ScanState.METADATA:
             self._update_metadata_status()
 
-        has_pending = any(rows for rows in self._pending_metadata_rows.values())
+        has_pending = any(rows for rows in self._pending_metadata_rows.values()) or any(
+            rows for rows in self._pending_metadata_updates.values()
+        )
         if has_pending and not self._metadata_flush_timer.isActive():
             self._metadata_flush_timer.start()
         elif not has_pending and self._metadata_flush_timer.isActive():
@@ -483,10 +528,12 @@ class MainWindow(QMainWindow):
             self._failed_flush_timer.stop()
 
     def _update_metadata_status(self):
+        if self._scan_state != ScanState.METADATA or self._worker_finished:
+            return
         total = max(1, self._discovery_count or self._metadata_processed)
         processed = min(self._metadata_processed, total)
         percent = int((processed / total) * 100)
-        self._status_bar.showMessage(f"Finalizing file list… {processed}/{total} ({percent}%)")
+        self._status_bar.showMessage(f"Metadata… {processed}/{total} ({percent}%)")
 
     def _try_finalize_scan(self):
         if not (self._discovery_finished and self._worker_finished):
