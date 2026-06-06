@@ -51,6 +51,21 @@ class MediaPanelVirtualAudioTests(unittest.TestCase):
         self.assertEqual(codec_text, "AAC")
         self.assertNotEqual(rec_text, "Pending probe")
 
+    def test_virtual_audio_metadata_update_uses_estimate(self):
+        self.panel.add_files([
+            ("C:/tmp/song.mp3", 1000, "1"),
+        ])
+
+        self.panel.update_file_stats([
+            ("C:/tmp/song.mp3", 1000, "1", 750),
+        ])
+
+        model = self.panel._virtual_model
+        assert model is not None
+
+        estimate_text = model.data(model.index(0, 4), Qt.ItemDataRole.DisplayRole)
+        self.assertEqual(estimate_text, "750 B (25% smaller)")
+
     def test_virtual_audio_file_count_tracks_total_rows(self):
         rows = [(f"C:/tmp/song-{idx}.mp3", 1000 + idx, "1") for idx in range(1500)]
         self.panel.add_files(rows)

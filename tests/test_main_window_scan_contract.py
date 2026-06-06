@@ -41,7 +41,7 @@ class MainWindowScanContractTests(unittest.TestCase):
             modified_timestamp="1",
             probe_info={"video_codec": "h264"},
             encoding="h264",
-            _estimate=100,
+            estimate=100,
             _recommend="H.265/HEVC",
         )
 
@@ -156,11 +156,11 @@ class MainWindowScanContractTests(unittest.TestCase):
                 self.prioritize_called = False
                 self.batch = None
 
-            def prioritize_stat_updates(self, updates: list[tuple[str, int, str]]):
+            def prioritize_stat_updates(self, updates):
                 self.prioritize_called = True
                 return list(reversed(updates))
 
-            def update_file_stats(self, batch: list[tuple[str, int, str]]):
+            def update_file_stats(self, batch):
                 self.batch = batch
 
         fake = _FakePanel()
@@ -177,6 +177,36 @@ class MainWindowScanContractTests(unittest.TestCase):
         self.assertTrue(fake.prioritize_called)
         self.assertEqual(fake.batch, [("second.mp4", 200, "2")])
         self.assertEqual(self.window._pending_metadata_updates["Videos"], [("first.mp4", 100, "1")])
+
+    def test_row_ready_preserves_estimate_for_metadata_flush(self):
+        class _FakePanel:
+            def __init__(self):
+                self.batch = None
+
+            def prioritize_stat_updates(self, updates):
+                return updates
+
+            def update_file_stats(self, batch):
+                self.batch = batch
+
+        fake = _FakePanel()
+        self.window._panels["Audio"] = fake
+
+        self.window._on_row_ready(
+            scan_token=42,
+            media_type="Audio",
+            path="C:/tmp/song.mp3",
+            size_bytes=1000,
+            modified_timestamp="1",
+            probe_info={"audio_codec": "aac"},
+            encoding="aac",
+            estimate=750,
+            _recommend="Keep AAC",
+        )
+
+        self.window._flush_metadata_rows(limit=0)
+
+        self.assertEqual(fake.batch, [("C:/tmp/song.mp3", 1000, "1", 750)])
 
     def test_discovery_finished_starts_metadata_worker_after_discovery(self):
         class _DummySignal:

@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
 
         self._discovered_files: list[tuple[str, str]] = []
         self._pending_metadata_rows: dict[str, list[tuple[str, int, str]]] = {}
-        self._pending_metadata_updates: dict[str, list[tuple[str, int, str]]] = {}
+        self._pending_metadata_updates: dict[str, list[tuple[str, int, str, int | None]]] = {}
         self._pending_probe_updates: dict[str, tuple[str, dict | None]] = {}
         self._pending_failed_rows: list[tuple[str, str, str]] = []
 
@@ -474,13 +474,13 @@ class MainWindow(QMainWindow):
         modified_timestamp: str,
         probe_info: dict | None,
         encoding: str | None,
-        _estimate: int | None,
+        estimate: int | None,
         _recommend: str | None,
     ):
         if scan_token != self._scan_token:
             return
 
-        self._pending_metadata_updates.setdefault(media_type, []).append((path, int(size_bytes), modified_timestamp))
+        self._pending_metadata_updates.setdefault(media_type, []).append((path, int(size_bytes), modified_timestamp, estimate))
         if media_type in {"Videos", "Audio"}:
             self._pending_probe_updates[path] = (media_type, probe_info)
 

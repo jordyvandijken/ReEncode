@@ -902,7 +902,7 @@ class MediaPanel(QWidget):
             self._conversion_thread = None
 
         self._update_label()
-        self._refresh_video_controls()
+        self._refresh_selection_controls()
         self.conversion_status_changed.emit(message, False)
 
         if success:
@@ -1042,9 +1042,16 @@ class MediaPanel(QWidget):
     def update_probe(self, path: str, probe_info: dict | None):
         self.update_probes([(path, probe_info)])
 
-    def update_file_stats(self, rows: list[tuple[str, int, str]]):
+    def update_file_stats(self, rows: list[tuple]):
         if not rows:
             return
+
+        def _unpack_row(row: tuple) -> tuple[str, int, str, int | None]:
+            if len(row) >= 4:
+                path, size_bytes, modified_timestamp, estimate_bytes = row[:4]
+                return str(path), int(size_bytes), str(modified_timestamp), estimate_bytes
+            path, size_bytes, modified_timestamp = row[:3]
+            return str(path), int(size_bytes), str(modified_timestamp), None
 
         if self._use_virtual_table:
             assert self._virtual_model is not None
@@ -1054,8 +1061,14 @@ class MediaPanel(QWidget):
                 restore_sorting = True
 
             row_updates: dict[str, dict] = {}
-            for path, size_bytes, modified_timestamp in rows:
-                estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, None)
+            for raw_row in rows:
+                path, size_bytes, modified_timestamp, estimate_bytes = _unpack_row(raw_row)
+                if estimate_bytes is not None and estimate_bytes >= 0:
+                    savings_ratio = max(0.0, min(0.99, 1.0 - (estimate_bytes / size_bytes))) if size_bytes > 0 else None
+                    estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
+                    estimate_sort = estimate_bytes
+                else:
+                    estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, None)
                 row_updates[path] = {
                     "size_bytes": int(size_bytes),
                     "size_text": _human_size(size_bytes),
@@ -1077,9 +1090,10 @@ class MediaPanel(QWidget):
 
         self._table.setUpdatesEnabled(False)
         try:
-            for path, size_bytes, modified_timestamp in rows:
-                row = self._row_for_path(path)
-                if row is None:
+            for raw_row in rows:
+                path, size_bytes, modified_timestamp, estimate_bytes = _unpack_row(raw_row)
+                table_row = self._row_for_path(path)
+                if table_row is None:
                     continue
 
                 size_item = _NumericItem(_human_size(size_bytes), size_bytes)
@@ -1091,13 +1105,29 @@ class MediaPanel(QWidget):
                 modified_item.setFlags(modified_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
                 if self._supports_conversion:
-                    self._table.setItem(row, VCOL_SIZE, size_item)
-                    self._table.setItem(row, VCOL_MODIFIED, modified_item)
+                    self._table.setItem(table_row, VCOL_SIZE, size_item)
+                    self._table.setItem(table_row, VCOL_MODIFIED, modified_item)
+                    if estimate_bytes is not None and estimate_bytes >= 0:
+                        savings_ratio = max(0.0, min(0.99, 1.0 - (estimate_bytes / size_bytes))) if size_bytes > 0 else None
+                        estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
+                        estimate_item = _NumericItem(estimate_text, estimate_bytes)
+                        estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    else:
+                        estimate_item = self._audio_estimate_item(path, size_bytes, None)
+                    self._table.setItem(table_row, VCOL_ESTIMATE, estimate_item)
                 else:
-                    self._table.setItem(row, COL_SIZE, size_item)
-                    self._table.setItem(row, COL_MODIFIED, modified_item)
-                    estimate_item = self._audio_estimate_item(path, size_bytes, None)
-                    self._table.setItem(row, COL_ESTIMATE, estimate_item)
+                    self._table.setItem(table_row, COL_SIZE, size_item)
+                    self._table.setItem(table_row, COL_MODIFIED, modified_item)
+                    if estimate_bytes is not None and estimate_bytes >= 0:
+                        savings_ratio = max(0.0, min(0.99, 1.0 - (estimate_bytes / size_bytes))) if size_bytes > 0 else None
+                        estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
+                        estimate_item = _NumericItem(estimate_text, estimate_bytes)
+                        estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    else:
+                        estimate_item = self._audio_estimate_item(path, size_bytes, None)
+                    self._table.setItem(table_row, COL_ESTIMATE, estimate_item)
         finally:
             self._table.setUpdatesEnabled(True)
 
@@ -1288,16 +1318,21 @@ class MediaPanel(QWidget):
                 hidden.append((path, probe_info))
         return visible + hidden
 
-    def prioritize_stat_updates(self, updates: list[tuple[str, int, str]]) -> list[tuple[str, int, str]]:
+    def prioritize_stat_updates(self, updates: list[tuple]) -> list[tuple]:
         visible_bounds = self._visible_row_bounds()
-        visible: list[tuple[str, int, str]] = []
-        hidden: list[tuple[str, int, str]] = []
-        for path, size_bytes, modified_timestamp in updates:
-            row = self._row_for_path(path)
-            if row is not None and visible_bounds is not None and visible_bounds[0] <= row <= visible_bounds[1]:
-                visible.append((path, size_bytes, modified_timestamp))
+        visible: list[tuple] = []
+        hidden: list[tuple] = []
+        for update_row in updates:
+            if len(update_row) < 3:
+                hidden.append(update_row)
+                continue
+
+            path = update_row[0]
+            row_index = self._row_for_path(path)
+            if row_index is not None and visible_bounds is not None and visible_bounds[0] <= row_index <= visible_bounds[1]:
+                visible.append(update_row)
             else:
-                hidden.append((path, size_bytes, modified_timestamp))
+                hidden.append(update_row)
         return visible + hidden
 
     def _update_label(self):
