@@ -56,6 +56,69 @@ class MetadataProbeWorkerTests(unittest.TestCase):
             self.assertEqual(processed, 1)
             self.assertEqual(probed, 1)
 
+    def test_storage_upsert_failure_is_non_fatal_per_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir(parents=True, exist_ok=True)
+
+            bad_file = root / "bad.jpg"
+            good_file = root / "good.jpg"
+            bad_file.write_bytes(b"bad")
+            good_file.write_bytes(b"good")
+
+            class _FakeStore:
+                def __init__(self):
+                    self.committed = False
+
+                def find_reusable_probe(self, absolute_path: str, file_size: int, last_modified: int):
+                    return None
+
+                def upsert_record(self, **kwargs):
+                    path = kwargs.get("absolute_path", "")
+                    if str(path).endswith("bad.jpg"):
+                        raise RuntimeError("write blocked")
+
+                def commit(self):
+                    self.committed = True
+
+                def close(self):
+                    return None
+
+            fake_store = _FakeStore()
+            worker = _MetadataProbeWorker(
+                scan_id=7,
+                store_path=str(Path(tmp) / "scan.db"),
+                source_roots=[str(root)],
+            )
+
+            failed_payloads: list[tuple[int, str, str, str, str]] = []
+            completed_payloads: list[tuple[int, str, bool, int, int]] = []
+            row_payloads: list[tuple] = []
+            worker.failed_item.connect(lambda *args: failed_payloads.append(args))
+            worker.completed.connect(lambda *args: completed_payloads.append(args))
+            worker.row_ready.connect(lambda *args: row_payloads.append(args))
+
+            worker.submit("Images", str(bad_file))
+            worker.submit("Images", str(good_file))
+            worker.finish(expected_total=2)
+
+            with mock.patch("reencode.main_window.ScanStore", return_value=fake_store):
+                worker.run()
+
+            self.assertEqual(len(row_payloads), 2)
+            self.assertEqual(len(failed_payloads), 1)
+            self.assertIn("Storage upsert failed", failed_payloads[0][3])
+            self.assertEqual(failed_payloads[0][4], "storage")
+
+            self.assertEqual(len(completed_payloads), 1)
+            scan_id, phase, cancelled, processed, probed = completed_payloads[0]
+            self.assertEqual(scan_id, 7)
+            self.assertEqual(phase, "metadata")
+            self.assertFalse(cancelled)
+            self.assertEqual(processed, 2)
+            self.assertEqual(probed, 0)
+            self.assertTrue(fake_store.committed)
+
 
 if __name__ == "__main__":
     unittest.main()

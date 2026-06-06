@@ -48,6 +48,52 @@ class MainWindowScanContractTests(unittest.TestCase):
         self.assertEqual(self.window._pending_metadata_rows, {})
         self.assertEqual(self.window._pending_probe_updates, {})
 
+    def test_scan_state_has_converting(self):
+        self.assertEqual(ScanState.CONVERTING.value, "converting")
+
+    def test_cancel_scan_requests_worker_cancellation(self):
+        class _DummyRunner:
+            def __init__(self):
+                self.cancelled = False
+
+            def isRunning(self):
+                return True
+
+            def cancel(self):
+                self.cancelled = True
+
+            def wait(self):
+                return True
+
+        scanner = _DummyRunner()
+        worker = _DummyRunner()
+        self.window._scan_state = ScanState.QUICKSCAN
+        self.window._scanner = scanner
+        self.window._metadata_probe_worker = worker
+
+        self.window._cancel_scan()
+
+        self.assertTrue(self.window._worker_cancelled)
+        self.assertTrue(scanner.cancelled)
+        self.assertTrue(worker.cancelled)
+
+    def test_file_found_persists_discovery_record(self):
+        root = Path(self._tmp.name)
+        path = str(root / "video.mp4")
+        self.window._active_source_roots = [str(root)]
+
+        self.window._on_file_found(
+            scan_token=42,
+            media_type="Videos",
+            path=path,
+        )
+
+        record = self.window._scan_store.get_record(path)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["media_type"], "Videos")
+        self.assertEqual(record["last_scanned"], 42)
+
     def test_failure_routing_buffers_and_flushes(self):
         bad_path = str(Path(self._tmp.name) / "bad.mp4")
 
@@ -102,6 +148,34 @@ class MainWindowScanContractTests(unittest.TestCase):
 
         self.assertEqual(self.window._panels["Videos"].file_count(), 1)
         self.assertEqual(self.window._scan_state, ScanState.IDLE)
+
+    def test_metadata_flush_uses_stat_prioritization(self):
+        class _FakePanel:
+            def __init__(self):
+                self.prioritize_called = False
+                self.batch = None
+
+            def prioritize_stat_updates(self, updates: list[tuple[str, int, str]]):
+                self.prioritize_called = True
+                return list(reversed(updates))
+
+            def update_file_stats(self, batch: list[tuple[str, int, str]]):
+                self.batch = batch
+
+        fake = _FakePanel()
+        self.window._panels["Videos"] = fake
+        self.window._pending_metadata_updates = {
+            "Videos": [
+                ("first.mp4", 100, "1"),
+                ("second.mp4", 200, "2"),
+            ]
+        }
+
+        self.window._flush_metadata_rows(limit=1)
+
+        self.assertTrue(fake.prioritize_called)
+        self.assertEqual(fake.batch, [("second.mp4", 200, "2")])
+        self.assertEqual(self.window._pending_metadata_updates["Videos"], [("first.mp4", 100, "1")])
 
     def test_discovery_finished_starts_metadata_worker_after_discovery(self):
         class _DummySignal:

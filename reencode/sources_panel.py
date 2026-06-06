@@ -9,6 +9,7 @@ class SourcesPanel(QWidget):
     """Panel that manages the list of folders to scan."""
 
     scan_requested = Signal(list)   # list[str] of folder paths
+    cancel_requested = Signal()
     _SETTINGS_KEY = "sources/folders"
 
     def __init__(self, parent=None):
@@ -45,6 +46,13 @@ class SourcesPanel(QWidget):
         self._btn_scan.clicked.connect(self._on_scan)
         layout.addWidget(self._btn_scan)
 
+        self._btn_cancel = QPushButton("Cancel Scan")
+        self._btn_cancel.setStyleSheet("font-weight: bold; padding: 6px;")
+        self._btn_cancel.setVisible(False)
+        self._btn_cancel.setEnabled(False)
+        self._btn_cancel.clicked.connect(self._on_cancel)
+        layout.addWidget(self._btn_cancel)
+
     def _on_add(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
         if not folder:
@@ -72,6 +80,9 @@ class SourcesPanel(QWidget):
         if folders:
             self.scan_requested.emit(folders)
 
+    def _on_cancel(self):
+        self.cancel_requested.emit()
+
     def _load_folders(self):
         saved = self._settings.value(self._SETTINGS_KEY, [])
         if isinstance(saved, str):
@@ -98,3 +109,5 @@ class SourcesPanel(QWidget):
         self._btn_remove.setEnabled(not scanning and bool(self._list.selectedItems()))
         self._btn_scan.setEnabled(not scanning and self._list.count() > 0)
         self._btn_scan.setText("Scanning…" if scanning else "Scan")
+        self._btn_cancel.setVisible(scanning)
+        self._btn_cancel.setEnabled(scanning)

@@ -138,17 +138,26 @@ class _MetadataProbeWorker(QThread):
                     recommend,
                 )
                 source_root = self._source_root_for_path(path)
-                store.upsert_record(
-                    absolute_path=path,
-                    source_root=source_root,
-                    media_type=media_type,
-                    file_size=size_bytes,
-                    last_modified=modified_int,
-                    scan_id=self._scan_id,
-                    encoding=encoding,
-                    probe=probe_info,
-                    commit=False,
-                )
+                try:
+                    store.upsert_record(
+                        absolute_path=path,
+                        source_root=source_root,
+                        media_type=media_type,
+                        file_size=size_bytes,
+                        last_modified=modified_int,
+                        scan_id=self._scan_id,
+                        encoding=encoding,
+                        probe=probe_info,
+                        commit=False,
+                    )
+                except Exception as exc:
+                    self.failed_item.emit(
+                        self._scan_id,
+                        media_type,
+                        path,
+                        f"Storage upsert failed: {exc}",
+                        ScanPhase.STORAGE.value,
+                    )
                 self._processed += 1
                 self._emit_progress()
 
@@ -186,6 +195,10 @@ class MainWindow(QMainWindow):
         self._worker_cancelled = False
         self._worker_processed_count = 0
         self._worker_probed_count = 0
+        self._cancel_requested = False
+
+        self._discovery_progress_count = 0
+        self._metadata_total = 0
 
         self._discovered_files: list[tuple[str, str]] = []
         self._pending_metadata_rows: dict[str, list[tuple[str, int, str]]] = {}
@@ -208,6 +221,10 @@ class MainWindow(QMainWindow):
         self._failed_flush_timer.setInterval(100)
         self._failed_flush_timer.timeout.connect(self._flush_failed_rows)
 
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(100)
+        self._status_timer.timeout.connect(self._refresh_scan_status)
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -218,6 +235,7 @@ class MainWindow(QMainWindow):
         self._sources_panel.setMinimumWidth(220)
         self._sources_panel.setMaximumWidth(360)
         self._sources_panel.scan_requested.connect(self._start_scan)
+        self._sources_panel.cancel_requested.connect(self._cancel_scan)
         splitter.addWidget(self._sources_panel)
 
         self._tab_widget = QTabWidget()
@@ -273,6 +291,9 @@ class MainWindow(QMainWindow):
         self._worker_cancelled = False
         self._worker_processed_count = 0
         self._worker_probed_count = 0
+        self._cancel_requested = False
+        self._discovery_progress_count = 0
+        self._metadata_total = 0
         self._pending_metadata_rows = {}
         self._pending_metadata_updates = {}
         self._pending_probe_updates = {}
@@ -282,6 +303,8 @@ class MainWindow(QMainWindow):
 
         self._sources_panel.set_scanning(True)
         self._status_bar.showMessage("Scanning…")
+        if not self._status_timer.isActive():
+            self._status_timer.start()
 
         self._metadata_probe_worker = None
 
@@ -292,9 +315,40 @@ class MainWindow(QMainWindow):
         self._scanner.fatal_error.connect(self._on_discovery_fatal_error)
         self._scanner.start()
 
+    def _cancel_scan(self):
+        if self._scan_state == ScanState.IDLE:
+            return
+
+        self._cancel_requested = True
+        self._worker_cancelled = True
+        if self._scanner and self._scanner.isRunning():
+            self._scanner.cancel()
+        if self._metadata_probe_worker and self._metadata_probe_worker.isRunning():
+            self._metadata_probe_worker.cancel()
+
+        self._status_bar.showMessage("Cancelling scan…")
+
     def _on_file_found(self, scan_token: int, media_type: str, path: str):
         if scan_token != self._scan_token:
             return
+
+        source_root = self._source_root_for_path(path)
+        try:
+            self._scan_store.upsert_record(
+                absolute_path=path,
+                source_root=source_root,
+                media_type=media_type,
+                file_size=0,
+                last_modified=0,
+                scan_id=self._scan_token,
+                commit=True,
+            )
+        except Exception as exc:
+            self._pending_failed_rows.append(
+                (os.path.basename(path) or media_type, f"Storage upsert failed: {exc} ({ScanPhase.STORAGE.value})", path)
+            )
+            if not self._failed_flush_timer.isActive():
+                self._failed_flush_timer.start()
 
         self._discovered_files.append((media_type, path))
         self._pending_metadata_rows.setdefault(media_type, []).append((path, 0, ""))
@@ -305,7 +359,7 @@ class MainWindow(QMainWindow):
     def _on_discovery_progress(self, scan_token: int, _phase: str, discovered_count: int, _total: int):
         if scan_token != self._scan_token:
             return
-        self._status_bar.showMessage(f"Scanning… {discovered_count} files found so far")
+        self._discovery_progress_count = discovered_count
 
     def _on_discovery_finished(self, scan_token: int, _phase: str, count: int, cancelled: bool):
         if scan_token != self._scan_token:
@@ -394,11 +448,7 @@ class MainWindow(QMainWindow):
             return
 
         self._metadata_processed = completed
-        if self._worker_finished or self._scan_state != ScanState.METADATA:
-            return
-        if completed % 25 != 0 and completed != total:
-            return
-        self._update_metadata_status()
+        self._metadata_total = max(total, completed)
 
     def _on_worker_completed(self, scan_token: int, _phase: str, cancelled: bool, processed: int, probed: int):
         sender = self.sender()
@@ -457,6 +507,8 @@ class MainWindow(QMainWindow):
             if panel is None:
                 rows.clear()
                 continue
+
+            rows[:] = panel.prioritize_stat_updates(rows)
 
             if limit == 0:
                 take = len(rows)
@@ -530,10 +582,22 @@ class MainWindow(QMainWindow):
     def _update_metadata_status(self):
         if self._scan_state != ScanState.METADATA or self._worker_finished:
             return
-        total = max(1, self._discovery_count or self._metadata_processed)
+        total = max(1, self._metadata_total or self._discovery_count or self._metadata_processed)
         processed = min(self._metadata_processed, total)
         percent = int((processed / total) * 100)
         self._status_bar.showMessage(f"Metadata… {processed}/{total} ({percent}%)")
+
+    def _refresh_scan_status(self):
+        if self._scan_state == ScanState.IDLE:
+            return
+        if self._cancel_requested:
+            self._status_bar.showMessage("Cancelling scan…")
+            return
+        if self._scan_state == ScanState.QUICKSCAN:
+            discovered = max(self._discovery_progress_count, self._total_found)
+            self._status_bar.showMessage(f"Scanning… {discovered} files found so far")
+            return
+        self._update_metadata_status()
 
     def _try_finalize_scan(self):
         if not (self._discovery_finished and self._worker_finished):
@@ -568,6 +632,9 @@ class MainWindow(QMainWindow):
         pruned = self._scan_store.prune_scan_scope(self._active_source_roots, self._scan_token)
 
         self._scan_state = ScanState.IDLE
+        self._cancel_requested = False
+        if self._status_timer.isActive():
+            self._status_timer.stop()
         self._sources_panel.set_scanning(False)
         for panel in self._panels.values():
             panel.set_scan_locked(False)
@@ -600,5 +667,7 @@ class MainWindow(QMainWindow):
             self._probe_flush_timer.stop()
         if self._failed_flush_timer.isActive():
             self._failed_flush_timer.stop()
+        if self._status_timer.isActive():
+            self._status_timer.stop()
         self._scan_store.close()
         super().closeEvent(event)

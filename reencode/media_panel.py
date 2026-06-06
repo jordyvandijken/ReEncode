@@ -92,10 +92,10 @@ class _NumericItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
-BASE_COLUMNS = ["Name", "Size", "Estimate", "Path", "Modified"]
+BASE_COLUMNS = ["Name", "Size", "Codec", "Recommend", "Estimate", "Path", "Modified"]
 VIDEO_COLUMNS = ["", "Name", "Size", "Codec", "Recommended", "Estimate", "Path", "Modified"]
 
-COL_NAME, COL_SIZE, COL_ESTIMATE, COL_PATH, COL_MODIFIED = range(5)
+COL_NAME, COL_SIZE, COL_CODEC, COL_REC, COL_ESTIMATE, COL_PATH, COL_MODIFIED = range(7)
 VCOL_SELECT, VCOL_NAME, VCOL_SIZE, VCOL_CODEC, VCOL_REC, VCOL_ESTIMATE, VCOL_PATH, VCOL_MODIFIED = range(8)
 
 # Colours for the Recommended cell
@@ -326,6 +326,8 @@ class MediaPanel(QWidget):
         else:
             self._table.horizontalHeader().setSectionResizeMode(COL_NAME,     QHeaderView.ResizeMode.ResizeToContents)
             self._table.horizontalHeader().setSectionResizeMode(COL_SIZE,     QHeaderView.ResizeMode.ResizeToContents)
+            self._table.horizontalHeader().setSectionResizeMode(COL_CODEC,    QHeaderView.ResizeMode.ResizeToContents)
+            self._table.horizontalHeader().setSectionResizeMode(COL_REC,      QHeaderView.ResizeMode.ResizeToContents)
             self._table.horizontalHeader().setSectionResizeMode(COL_ESTIMATE, QHeaderView.ResizeMode.ResizeToContents)
             self._table.horizontalHeader().setSectionResizeMode(COL_PATH,     QHeaderView.ResizeMode.Stretch)
             self._table.horizontalHeader().setSectionResizeMode(COL_MODIFIED, QHeaderView.ResizeMode.ResizeToContents)
@@ -537,6 +539,43 @@ class MediaPanel(QWidget):
         estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         return estimate_item
 
+    def _base_codec_recommend_items(self, probe_info: dict | None):
+        if self._media_type == "Audio":
+            raw_codec = (probe_info or {}).get("audio_codec")
+            if raw_codec:
+                codec_text = codec_probe.codec_label(raw_codec)
+                status, rec_label, reason = codec_probe.recommendation(raw_codec)
+            elif probe_info is None:
+                codec_text = "Probing..."
+                status, rec_label, reason = (
+                    "pending",
+                    "Pending probe",
+                    "Codec details will appear after the async probe phase.",
+                )
+            else:
+                codec_text = "Unknown"
+                status, rec_label, reason = ("pending", "Pending probe", "No audio codec details were reported.")
+        else:
+            codec_text = "-"
+            status, rec_label, reason = ("pending", "-", "Recommendations are only available for audio/video codecs.")
+
+        codec_item = QTableWidgetItem(codec_text)
+        rec_item = QTableWidgetItem(rec_label)
+        rec_item.setToolTip(reason)
+
+        color = {
+            "optimal": _COLOR_OPTIMAL,
+            "good": _COLOR_GOOD,
+            "pending": _COLOR_PENDING,
+        }.get(status, _COLOR_REENCODE)
+        rec_item.setForeground(color)
+        rec_item.setFont(_bold_font(rec_item.font()))
+
+        for item in (codec_item, rec_item):
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+        return codec_item, rec_item
+
     def _convert_selected(self):
         if self._conversion_thread is not None:
             return
@@ -623,13 +662,16 @@ class MediaPanel(QWidget):
             self._table.setItem(row, VCOL_PATH, path_item)
             self._table.setItem(row, VCOL_MODIFIED, modified_item)
         else:
+            codec_item, rec_item = self._base_codec_recommend_items(None)
             estimate_item = self._audio_estimate_item(path, size_bytes, None)
 
-            for item in (name_item, size_item, estimate_item, path_item, modified_item):
+            for item in (name_item, size_item, codec_item, rec_item, estimate_item, path_item, modified_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             self._table.setItem(row, COL_NAME, name_item)
             self._table.setItem(row, COL_SIZE, size_item)
+            self._table.setItem(row, COL_CODEC, codec_item)
+            self._table.setItem(row, COL_REC, rec_item)
             self._table.setItem(row, COL_ESTIMATE, estimate_item)
             self._table.setItem(row, COL_PATH, path_item)
             self._table.setItem(row, COL_MODIFIED, modified_item)
@@ -773,6 +815,9 @@ class MediaPanel(QWidget):
             self._table.setItem(row, VCOL_REC, rec_item)
             self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
         else:
+            codec_item, rec_item = self._base_codec_recommend_items(probe_info)
+            self._table.setItem(row, COL_CODEC, codec_item)
+            self._table.setItem(row, COL_REC, rec_item)
             estimate_item = self._audio_estimate_item(path, size_bytes, probe_info)
             self._table.setItem(row, COL_ESTIMATE, estimate_item)
 
@@ -810,6 +855,17 @@ class MediaPanel(QWidget):
                 visible.append((path, probe_info))
             else:
                 hidden.append((path, probe_info))
+        return visible + hidden
+
+    def prioritize_stat_updates(self, updates: list[tuple[str, int, str]]) -> list[tuple[str, int, str]]:
+        visible: list[tuple[str, int, str]] = []
+        hidden: list[tuple[str, int, str]] = []
+        for path, size_bytes, modified_timestamp in updates:
+            row = self._row_for_path(path)
+            if row is not None and self._is_row_visible(row):
+                visible.append((path, size_bytes, modified_timestamp))
+            else:
+                hidden.append((path, size_bytes, modified_timestamp))
         return visible + hidden
 
     def _update_label(self):

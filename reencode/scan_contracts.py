@@ -7,6 +7,7 @@ class ScanState(StrEnum):
     IDLE = "idle"
     QUICKSCAN = "quickscan"
     METADATA = "metadata"
+    CONVERTING = "converting"
 
 
 class ScanPhase(StrEnum):
