@@ -4,15 +4,18 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QThread, Qt, Signal, QTimer
+from PySide6.QtCore import QThread, QPoint, QSettings, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QHeaderView,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -21,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from reencode import codec_probe
 from reencode import size_estimator
+from reencode.virtual_media_model import VirtualMediaTableModel, recommendation_color
 
 
 def _bold_font(font: QFont) -> QFont:
@@ -103,6 +107,7 @@ _COLOR_OPTIMAL  = QColor("#2e7d32")   # dark green
 _COLOR_GOOD     = QColor("#1565c0")   # dark blue
 _COLOR_REENCODE = QColor("#e65100")   # dark orange
 _COLOR_PENDING  = QColor("#616161")   # neutral gray
+_PAGE_SIZE_OPTIONS = (25, 50, 100, 250)
 
 
 def _recommended_ffmpeg_args(recommended_label: str) -> list[str]:
@@ -271,11 +276,22 @@ class MediaPanel(QWidget):
         super().__init__(parent)
         self._media_type = media_type
         self._is_video = media_type == "Videos"
+        self._use_virtual_table = (
+            not self._is_video
+            and os.getenv("REENCODE_VIRTUAL_AUDIO_TABLE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        )
         self._conversion_thread: _ConversionThread | None = None
         self._probe_updates_active = False
         self._scan_locked = False
         self._path_rows: dict[str, int] = {}
+        self._path_rows_dirty = False
+        self._virtual_model: VirtualMediaTableModel | None = None
         self._suspend_check_updates = False
+        self._settings = QSettings()
+        self._pagination_settings_prefix = f"pagination/{self._media_type.lower()}"
+        self._pagination_page_size = self._load_page_size_setting()
+        self._pagination_page = self._load_page_setting()
+        self._pagination_restoring = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -285,10 +301,34 @@ class MediaPanel(QWidget):
         top_bar = QHBoxLayout()
         self._label = QLabel("No files found yet.")
         top_bar.addWidget(self._label)
+        top_bar.addStretch(1)
+
+        self._page_size_label = QLabel("Items:")
+        top_bar.addWidget(self._page_size_label)
+
+        self._page_size_combo = QComboBox()
+        for size in _PAGE_SIZE_OPTIONS:
+            self._page_size_combo.addItem(str(size), size)
+        size_index = self._page_size_combo.findData(self._pagination_page_size)
+        if size_index < 0:
+            size_index = self._page_size_combo.findData(_PAGE_SIZE_OPTIONS[1])
+            self._pagination_page_size = int(_PAGE_SIZE_OPTIONS[1])
+        self._page_size_combo.setCurrentIndex(size_index)
+        self._page_size_combo.currentIndexChanged.connect(self._on_page_size_changed)
+        top_bar.addWidget(self._page_size_combo)
+
+        self._prev_page_button = QPushButton("Prev")
+        self._prev_page_button.clicked.connect(self._on_prev_page)
+        top_bar.addWidget(self._prev_page_button)
+
+        self._next_page_button = QPushButton("Next")
+        self._next_page_button.clicked.connect(self._on_next_page)
+        top_bar.addWidget(self._next_page_button)
+
+        self._page_label = QLabel("Page 0 of 0")
+        top_bar.addWidget(self._page_label)
 
         if self._is_video:
-            top_bar.addStretch(1)
-
             self._select_all = QCheckBox("Select all")
             self._select_all.setTristate(True)
             self._select_all.stateChanged.connect(self._on_select_all_changed)
@@ -311,8 +351,13 @@ class MediaPanel(QWidget):
         else:
             columns = BASE_COLUMNS
 
-        self._table = QTableWidget(0, len(columns))
-        self._table.setHorizontalHeaderLabels(columns)
+        if self._use_virtual_table:
+            self._virtual_model = VirtualMediaTableModel(columns, parent=self)
+            self._table = QTableView()
+            self._table.setModel(self._virtual_model)
+        else:
+            self._table = QTableWidget(0, len(columns))
+            self._table.setHorizontalHeaderLabels(columns)
 
         if self._is_video:
             self._table.horizontalHeader().setSectionResizeMode(VCOL_SELECT,    QHeaderView.ResizeMode.ResizeToContents)
@@ -334,16 +379,19 @@ class MediaPanel(QWidget):
 
         self._table.horizontalHeader().setSortIndicatorShown(True)
         self._table.setSortingEnabled(True)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
+        if not self._use_virtual_table:
+            self._table.horizontalHeader().sortIndicatorChanged.connect(self._invalidate_path_rows)
         # Keep path data in the model for internal lookups, but hide it from the UI.
         self._table.setColumnHidden(VCOL_PATH if self._is_video else COL_PATH, True)
-        if self._is_video:
+        if self._is_video and not self._use_virtual_table:
             self._table.itemChanged.connect(self._on_table_item_changed)
         layout.addWidget(self._table)
 
+        self._apply_pagination(save_settings=False)
         if self._is_video:
             self._refresh_video_controls()
 
@@ -403,7 +451,97 @@ class MediaPanel(QWidget):
         self._convert_button.setEnabled(selected > 0 and enabled)
         self._do_not_replace.setEnabled(total > 0 and enabled)
         self._select_all.setEnabled(total > 0 and enabled)
+        self._refresh_pagination_controls()
         self._update_label()
+
+    def _load_page_size_setting(self) -> int:
+        raw = self._settings.value(f"{self._pagination_settings_prefix}/page_size", _PAGE_SIZE_OPTIONS[1])
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return int(_PAGE_SIZE_OPTIONS[1])
+        if parsed not in _PAGE_SIZE_OPTIONS:
+            return int(_PAGE_SIZE_OPTIONS[1])
+        return parsed
+
+    def _load_page_setting(self) -> int:
+        raw = self._settings.value(f"{self._pagination_settings_prefix}/page", 0)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    def _save_pagination_settings(self):
+        self._settings.setValue(f"{self._pagination_settings_prefix}/page_size", int(self._pagination_page_size))
+        self._settings.setValue(f"{self._pagination_settings_prefix}/page", int(self._pagination_page))
+
+    def _total_pages(self) -> int:
+        count = self.file_count()
+        if count <= 0:
+            return 0
+        return (count + self._pagination_page_size - 1) // self._pagination_page_size
+
+    def _clamp_page(self):
+        total_pages = self._total_pages()
+        if total_pages <= 0:
+            self._pagination_page = 0
+            return
+        self._pagination_page = max(0, min(self._pagination_page, total_pages - 1))
+
+    def _apply_pagination(self, *, save_settings: bool = True):
+        self._clamp_page()
+
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            self._virtual_model.set_pagination(self._pagination_page, self._pagination_page_size)
+        else:
+            start = self._pagination_page * self._pagination_page_size
+            end = start + self._pagination_page_size
+            for row in range(self._table.rowCount()):
+                self._table.setRowHidden(row, row < start or row >= end)
+
+        self._refresh_pagination_controls()
+        if save_settings and not self._pagination_restoring:
+            self._save_pagination_settings()
+
+    def _refresh_pagination_controls(self):
+        total_pages = self._total_pages()
+        if total_pages <= 0:
+            self._page_label.setText("Page 0 of 0")
+            self._prev_page_button.setEnabled(False)
+            self._next_page_button.setEnabled(False)
+            return
+
+        self._page_label.setText(f"Page {self._pagination_page + 1} of {total_pages}")
+        self._prev_page_button.setEnabled(self._pagination_page > 0)
+        self._next_page_button.setEnabled(self._pagination_page + 1 < total_pages)
+
+    def _on_page_size_changed(self, _index: int):
+        data = self._page_size_combo.currentData()
+        try:
+            page_size = int(data)
+        except (TypeError, ValueError):
+            return
+
+        if page_size <= 0:
+            return
+
+        if page_size != self._pagination_page_size:
+            self._pagination_page_size = page_size
+            self._pagination_page = 0
+            self._apply_pagination(save_settings=True)
+
+    def _on_prev_page(self):
+        if self._pagination_page <= 0:
+            return
+        self._pagination_page -= 1
+        self._apply_pagination(save_settings=True)
+
+    def _on_next_page(self):
+        if self._pagination_page + 1 >= self._total_pages():
+            return
+        self._pagination_page += 1
+        self._apply_pagination(save_settings=True)
 
     def _selected_row_count(self) -> int:
         selected = 0
@@ -438,21 +576,39 @@ class MediaPanel(QWidget):
     def _path_column(self) -> int:
         return VCOL_PATH if self._is_video else COL_PATH
 
+    def _invalidate_path_rows(self, *_args):
+        self._path_rows_dirty = True
+
     def _rebuild_path_rows(self):
+        if self._use_virtual_table:
+            return
+
         self._path_rows.clear()
         path_col = self._path_column()
         for row in range(self._table.rowCount()):
             path_item = self._table.item(row, path_col)
             if path_item is not None:
                 self._path_rows[path_item.text()] = row
+        self._path_rows_dirty = False
 
     def _row_for_path(self, path: str) -> int | None:
-        row = self._path_rows.get(path)
-        if row is not None:
-            path_item = self._table.item(row, self._path_column())
-            if path_item is not None and path_item.text() == path:
-                return row
+        if self._use_virtual_table:
+            if self._virtual_model is None:
+                return None
+            return self._virtual_model.row_for_path(path)
 
+        if self._path_rows_dirty:
+            self._rebuild_path_rows()
+
+        row = self._path_rows.get(path)
+        if row is None:
+            return None
+
+        path_item = self._table.item(row, self._path_column())
+        if path_item is not None and path_item.text() == path:
+            return row
+
+        # A stale row index can occur after table sorting/layout changes.
         self._rebuild_path_rows()
         return self._path_rows.get(path)
 
@@ -517,11 +673,19 @@ class MediaPanel(QWidget):
         return codec_item, rec_item, estimate_item
 
     def _audio_estimate_item(self, path: str, size_bytes: int, probe_info: dict | None):
-        if self._media_type.lower() == "audio" and probe_info is None:
-            estimate_item = _NumericItem("Pending probe", -1)
+        estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
+        estimate_item = _NumericItem(estimate_text, estimate_sort)
+        if estimate_text == "Pending probe":
             estimate_item.setToolTip("Estimate appears after probe completes.")
-            estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            return estimate_item
+        elif estimate_sort >= 0:
+            estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        return estimate_item
+
+    def _audio_estimate_values(self, path: str, size_bytes: int, probe_info: dict | None) -> tuple[str, float]:
+        if self._media_type.lower() == "audio" and probe_info is None:
+            return "Pending probe", -1
 
         estimate_bytes, savings_ratio = size_estimator.estimate_output(
             size_bytes,
@@ -530,16 +694,32 @@ class MediaPanel(QWidget):
             probe_info,
         )
         if estimate_bytes is None:
-            estimate_item = _NumericItem("—", -1)
+            return "—", -1
         else:
             estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
-            estimate_item = _NumericItem(estimate_text, estimate_bytes)
-            estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        return estimate_item
+            return estimate_text, estimate_bytes
 
     def _base_codec_recommend_items(self, probe_info: dict | None):
+        codec_text, rec_label, reason, status = self._base_codec_recommend_values(probe_info)
+
+        codec_item = QTableWidgetItem(codec_text)
+        rec_item = QTableWidgetItem(rec_label)
+        rec_item.setToolTip(reason)
+
+        color = {
+            "optimal": _COLOR_OPTIMAL,
+            "good": _COLOR_GOOD,
+            "pending": _COLOR_PENDING,
+        }.get(status, _COLOR_REENCODE)
+        rec_item.setForeground(color)
+        rec_item.setFont(_bold_font(rec_item.font()))
+
+        for item in (codec_item, rec_item):
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+        return codec_item, rec_item
+
+    def _base_codec_recommend_values(self, probe_info: dict | None) -> tuple[str, str, str, str]:
         if self._media_type == "Audio":
             raw_codec = (probe_info or {}).get("audio_codec")
             if raw_codec:
@@ -558,23 +738,24 @@ class MediaPanel(QWidget):
         else:
             codec_text = "-"
             status, rec_label, reason = ("pending", "-", "Recommendations are only available for audio/video codecs.")
+        return codec_text, rec_label, reason, status
 
-        codec_item = QTableWidgetItem(codec_text)
-        rec_item = QTableWidgetItem(rec_label)
-        rec_item.setToolTip(reason)
-
-        color = {
-            "optimal": _COLOR_OPTIMAL,
-            "good": _COLOR_GOOD,
-            "pending": _COLOR_PENDING,
-        }.get(status, _COLOR_REENCODE)
-        rec_item.setForeground(color)
-        rec_item.setFont(_bold_font(rec_item.font()))
-
-        for item in (codec_item, rec_item):
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-
-        return codec_item, rec_item
+    def _virtual_row(self, path: str, size_bytes: int, modified_timestamp: str, probe_info: dict | None) -> dict:
+        codec_text, rec_label, reason, status = self._base_codec_recommend_values(probe_info)
+        estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
+        return {
+            "name": os.path.basename(path),
+            "size_bytes": int(size_bytes),
+            "size_text": _human_size(size_bytes),
+            "codec": codec_text,
+            "recommend": rec_label,
+            "rec_reason": reason,
+            "rec_color": recommendation_color(status),
+            "estimate_text": estimate_text,
+            "estimate_sort": estimate_sort,
+            "path": path,
+            "modified": self._format_modified(modified_timestamp),
+        }
 
     def _convert_selected(self):
         if self._conversion_thread is not None:
@@ -688,6 +869,10 @@ class MediaPanel(QWidget):
             return "—"
 
     def add_file(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
+        if self._use_virtual_table:
+            self.add_files([(path, size_bytes, modified_timestamp)])
+            return
+
         # Disable sorting while inserting to avoid row-index shifting
         self._table.setSortingEnabled(False)
         self._suspend_check_updates = True
@@ -696,13 +881,25 @@ class MediaPanel(QWidget):
 
         self._suspend_check_updates = False
         self._table.setSortingEnabled(True)
-        self._rebuild_path_rows()
+        self._invalidate_path_rows()
+        self._apply_pagination(save_settings=False)
         self._update_label()
         if self._is_video:
             self._refresh_video_controls()
 
     def add_files(self, rows: list[tuple[str, int, str]]):
         if not rows:
+            return
+
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            self._table.setSortingEnabled(False)
+            self._virtual_model.append_rows(
+                [self._virtual_row(path, size_bytes, modified_timestamp, None) for path, size_bytes, modified_timestamp in rows]
+            )
+            self._table.setSortingEnabled(True)
+            self._apply_pagination(save_settings=False)
+            self._update_label()
             return
 
         self._table.setSortingEnabled(False)
@@ -712,7 +909,8 @@ class MediaPanel(QWidget):
 
         self._suspend_check_updates = False
         self._table.setSortingEnabled(True)
-        self._rebuild_path_rows()
+        self._invalidate_path_rows()
+        self._apply_pagination(save_settings=False)
         self._update_label()
         if self._is_video:
             self._refresh_video_controls()
@@ -722,6 +920,30 @@ class MediaPanel(QWidget):
 
     def update_file_stats(self, rows: list[tuple[str, int, str]]):
         if not rows:
+            return
+
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            restore_sorting = False
+            if not self._probe_updates_active:
+                self._table.setSortingEnabled(False)
+                restore_sorting = True
+
+            row_updates: dict[str, dict] = {}
+            for path, size_bytes, modified_timestamp in rows:
+                estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, None)
+                row_updates[path] = {
+                    "size_bytes": int(size_bytes),
+                    "size_text": _human_size(size_bytes),
+                    "modified": self._format_modified(modified_timestamp),
+                    "estimate_text": estimate_text,
+                    "estimate_sort": estimate_sort,
+                }
+
+            self._virtual_model.update_rows(row_updates)
+
+            if restore_sorting:
+                self._table.setSortingEnabled(True)
             return
 
         restore_sorting = False
@@ -755,8 +977,6 @@ class MediaPanel(QWidget):
         finally:
             self._table.setUpdatesEnabled(True)
 
-        self._table.viewport().update()
-
         if restore_sorting:
             self._table.setSortingEnabled(True)
 
@@ -764,7 +984,8 @@ class MediaPanel(QWidget):
         if self._probe_updates_active:
             return
 
-        self._rebuild_path_rows()
+        if not self._use_virtual_table:
+            self._rebuild_path_rows()
         # Keep sorting suspended for the entire probe phase to avoid full-table
         # resorting on every small update batch.
         self._probe_updates_active = True
@@ -775,10 +996,43 @@ class MediaPanel(QWidget):
             return
 
         self._probe_updates_active = False
-        QTimer.singleShot(0, lambda: self._table.setSortingEnabled(True))
+        QTimer.singleShot(0, self._restore_sorting_after_probe)
+
+    def _restore_sorting_after_probe(self):
+        self._table.setSortingEnabled(True)
+        self._invalidate_path_rows()
 
     def update_probes(self, updates: list[tuple[str, dict | None]]):
         if not updates:
+            return
+
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            restore_sorting = False
+            if not self._probe_updates_active:
+                self._table.setSortingEnabled(False)
+                restore_sorting = True
+
+            row_updates: dict[str, dict] = {}
+            for path, probe_info in self._prioritize_updates(updates):
+                size_bytes = self._virtual_model.size_for_path(path)
+                if size_bytes is None:
+                    continue
+                codec_text, rec_label, reason, status = self._base_codec_recommend_values(probe_info)
+                estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
+                row_updates[path] = {
+                    "codec": codec_text,
+                    "recommend": rec_label,
+                    "rec_reason": reason,
+                    "rec_color": recommendation_color(status),
+                    "estimate_text": estimate_text,
+                    "estimate_sort": estimate_sort,
+                }
+
+            self._virtual_model.update_rows(row_updates)
+
+            if restore_sorting:
+                self._table.setSortingEnabled(True)
             return
 
         restore_sorting = False
@@ -792,8 +1046,6 @@ class MediaPanel(QWidget):
                 self._apply_probe_update(path, probe_info)
         finally:
             self._table.setUpdatesEnabled(True)
-
-        self._table.viewport().update()
 
         if restore_sorting:
             self._table.setSortingEnabled(True)
@@ -822,15 +1074,29 @@ class MediaPanel(QWidget):
             self._table.setItem(row, COL_ESTIMATE, estimate_item)
 
     def clear(self):
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            self._virtual_model.clear_rows()
+            self._pagination_page = 0
+            self._apply_pagination(save_settings=True)
+            self._update_label()
+            return
+
         self._suspend_check_updates = True
         self._path_rows.clear()
+        self._path_rows_dirty = False
         self._table.setRowCount(0)
         self._suspend_check_updates = False
+        self._pagination_page = 0
+        self._apply_pagination(save_settings=True)
         self._update_label()
         if self._is_video:
             self._refresh_video_controls()
 
     def file_count(self) -> int:
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            return self._virtual_model.total_row_count()
         return self._table.rowCount()
 
     def set_scan_locked(self, locked: bool):
@@ -839,37 +1105,66 @@ class MediaPanel(QWidget):
             self._refresh_video_controls()
 
     def _is_row_visible(self, row: int) -> bool:
-        top = self._table.rowViewportPosition(row)
-        if top < 0:
+        visible_bounds = self._visible_row_bounds()
+        if visible_bounds is None:
             return False
-        bottom = top + self._table.rowHeight(row)
-        viewport_height = self._table.viewport().height()
-        return bottom >= 0 and top <= viewport_height
+        first_visible, last_visible = visible_bounds
+        return first_visible <= row <= last_visible
+
+    def _visible_row_bounds(self) -> tuple[int, int] | None:
+        row_count = self._table.model().rowCount() if self._table.model() is not None else 0
+        if row_count <= 0:
+            return None
+
+        viewport = self._table.viewport()
+        height = viewport.height()
+        if height <= 0:
+            return None
+
+        top_index = self._table.indexAt(QPoint(0, 0))
+        bottom_index = self._table.indexAt(QPoint(0, max(0, height - 1)))
+
+        if not top_index.isValid():
+            top_index = self._table.indexAt(QPoint(0, min(height - 1, 1)))
+        if not bottom_index.isValid():
+            bottom_index = self._table.indexAt(QPoint(0, max(0, height - 1)))
+
+        if not top_index.isValid() and not bottom_index.isValid():
+            return None
+
+        first_visible = top_index.row() if top_index.isValid() else bottom_index.row()
+        last_visible = bottom_index.row() if bottom_index.isValid() else first_visible
+        if first_visible > last_visible:
+            first_visible, last_visible = last_visible, first_visible
+
+        return first_visible, last_visible
 
     def _prioritize_updates(self, updates: list[tuple[str, dict | None]]) -> list[tuple[str, dict | None]]:
+        visible_bounds = self._visible_row_bounds()
         visible: list[tuple[str, dict | None]] = []
         hidden: list[tuple[str, dict | None]] = []
         for path, probe_info in updates:
             row = self._row_for_path(path)
-            if row is not None and self._is_row_visible(row):
+            if row is not None and visible_bounds is not None and visible_bounds[0] <= row <= visible_bounds[1]:
                 visible.append((path, probe_info))
             else:
                 hidden.append((path, probe_info))
         return visible + hidden
 
     def prioritize_stat_updates(self, updates: list[tuple[str, int, str]]) -> list[tuple[str, int, str]]:
+        visible_bounds = self._visible_row_bounds()
         visible: list[tuple[str, int, str]] = []
         hidden: list[tuple[str, int, str]] = []
         for path, size_bytes, modified_timestamp in updates:
             row = self._row_for_path(path)
-            if row is not None and self._is_row_visible(row):
+            if row is not None and visible_bounds is not None and visible_bounds[0] <= row <= visible_bounds[1]:
                 visible.append((path, size_bytes, modified_timestamp))
             else:
                 hidden.append((path, size_bytes, modified_timestamp))
         return visible + hidden
 
     def _update_label(self):
-        count = self._table.rowCount()
+        count = self.file_count()
         if count == 0:
             self._label.setText("No files found yet.")
         else:
@@ -886,14 +1181,48 @@ class FailedPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._settings = QSettings()
+        self._pagination_settings_prefix = "pagination/failed"
+        self._pagination_page_size = self._load_page_size_setting()
+        self._pagination_page = self._load_page_setting()
+        self._pagination_restoring = False
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
+        top_bar = QHBoxLayout()
         self._label = QLabel("No failures.")
-        layout.addWidget(self._label)
+        top_bar.addWidget(self._label)
+        top_bar.addStretch(1)
+
+        self._page_size_label = QLabel("Items:")
+        top_bar.addWidget(self._page_size_label)
+
+        self._page_size_combo = QComboBox()
+        for size in _PAGE_SIZE_OPTIONS:
+            self._page_size_combo.addItem(str(size), size)
+        size_index = self._page_size_combo.findData(self._pagination_page_size)
+        if size_index < 0:
+            size_index = self._page_size_combo.findData(_PAGE_SIZE_OPTIONS[1])
+            self._pagination_page_size = int(_PAGE_SIZE_OPTIONS[1])
+        self._page_size_combo.setCurrentIndex(size_index)
+        self._page_size_combo.currentIndexChanged.connect(self._on_page_size_changed)
+        top_bar.addWidget(self._page_size_combo)
+
+        self._prev_page_button = QPushButton("Prev")
+        self._prev_page_button.clicked.connect(self._on_prev_page)
+        top_bar.addWidget(self._prev_page_button)
+
+        self._next_page_button = QPushButton("Next")
+        self._next_page_button.clicked.connect(self._on_next_page)
+        top_bar.addWidget(self._next_page_button)
+
+        self._page_label = QLabel("Page 0 of 0")
+        top_bar.addWidget(self._page_label)
+
+        layout.addLayout(top_bar)
 
         self._table = QTableWidget(0, 3)
         self._table.setHorizontalHeaderLabels(["Name", "Reason", "Absolute Path"])
@@ -905,6 +1234,90 @@ class FailedPanel(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
         layout.addWidget(self._table)
+        self._apply_pagination(save_settings=False)
+
+    def _load_page_size_setting(self) -> int:
+        raw = self._settings.value(f"{self._pagination_settings_prefix}/page_size", _PAGE_SIZE_OPTIONS[1])
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return int(_PAGE_SIZE_OPTIONS[1])
+        if parsed not in _PAGE_SIZE_OPTIONS:
+            return int(_PAGE_SIZE_OPTIONS[1])
+        return parsed
+
+    def _load_page_setting(self) -> int:
+        raw = self._settings.value(f"{self._pagination_settings_prefix}/page", 0)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    def _save_pagination_settings(self):
+        self._settings.setValue(f"{self._pagination_settings_prefix}/page_size", int(self._pagination_page_size))
+        self._settings.setValue(f"{self._pagination_settings_prefix}/page", int(self._pagination_page))
+
+    def _total_pages(self) -> int:
+        count = self.file_count()
+        if count <= 0:
+            return 0
+        return (count + self._pagination_page_size - 1) // self._pagination_page_size
+
+    def _clamp_page(self):
+        total_pages = self._total_pages()
+        if total_pages <= 0:
+            self._pagination_page = 0
+            return
+        self._pagination_page = max(0, min(self._pagination_page, total_pages - 1))
+
+    def _apply_pagination(self, *, save_settings: bool = True):
+        self._clamp_page()
+        start = self._pagination_page * self._pagination_page_size
+        end = start + self._pagination_page_size
+        for row in range(self._table.rowCount()):
+            self._table.setRowHidden(row, row < start or row >= end)
+        self._refresh_pagination_controls()
+        if save_settings and not self._pagination_restoring:
+            self._save_pagination_settings()
+
+    def _refresh_pagination_controls(self):
+        total_pages = self._total_pages()
+        if total_pages <= 0:
+            self._page_label.setText("Page 0 of 0")
+            self._prev_page_button.setEnabled(False)
+            self._next_page_button.setEnabled(False)
+            return
+
+        self._page_label.setText(f"Page {self._pagination_page + 1} of {total_pages}")
+        self._prev_page_button.setEnabled(self._pagination_page > 0)
+        self._next_page_button.setEnabled(self._pagination_page + 1 < total_pages)
+
+    def _on_page_size_changed(self, _index: int):
+        data = self._page_size_combo.currentData()
+        try:
+            page_size = int(data)
+        except (TypeError, ValueError):
+            return
+
+        if page_size <= 0:
+            return
+
+        if page_size != self._pagination_page_size:
+            self._pagination_page_size = page_size
+            self._pagination_page = 0
+            self._apply_pagination(save_settings=True)
+
+    def _on_prev_page(self):
+        if self._pagination_page <= 0:
+            return
+        self._pagination_page -= 1
+        self._apply_pagination(save_settings=True)
+
+    def _on_next_page(self):
+        if self._pagination_page + 1 >= self._total_pages():
+            return
+        self._pagination_page += 1
+        self._apply_pagination(save_settings=True)
 
     def add_failures(self, rows: list[tuple[str, str, str]]):
         if not rows:
@@ -921,10 +1334,13 @@ class FailedPanel(QWidget):
         finally:
             self._table.setUpdatesEnabled(True)
         self._table.viewport().update()
+        self._apply_pagination(save_settings=False)
         self._update_label()
 
     def clear(self):
         self._table.setRowCount(0)
+        self._pagination_page = 0
+        self._apply_pagination(save_settings=True)
         self._update_label()
 
     def file_count(self) -> int:
