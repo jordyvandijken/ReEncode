@@ -5,10 +5,10 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication
 
-from reencode.media_panel import FailedPanel, MediaPanel
+from reencode.media_panel import FailedPanel, MediaPanel, VCOL_CODEC, VCOL_REC, VCOL_SELECT
 
 
 class MediaPanelPathIndexTests(unittest.TestCase):
@@ -156,6 +156,75 @@ class FailedPanelPaginationTests(unittest.TestCase):
             row for row in range(self.panel._table.rowCount()) if not self.panel._table.isRowHidden(row)
         ]
         self.assertEqual(len(visible_second_page), 15)
+
+
+class MediaPanelConversionParityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = QApplication.instance() or QApplication([])
+
+    def test_audio_panel_exposes_selection_and_convert_controls(self):
+        panel = MediaPanel("Audio")
+        try:
+            panel.add_file("C:/tmp/song.mp3", 1000, "1")
+            select_item = panel._table.item(0, VCOL_SELECT)
+            self.assertIsNotNone(select_item)
+            assert select_item is not None
+            select_item.setCheckState(Qt.CheckState.Checked)
+
+            self.assertTrue(hasattr(panel, "_convert_button"))
+            self.assertTrue(panel._convert_button.isEnabled())
+        finally:
+            panel.close()
+
+    def test_images_panel_forces_copy_mode(self):
+        panel = MediaPanel("Images")
+        try:
+            panel.add_file("C:/tmp/picture.jpg", 2048, "1")
+            select_item = panel._table.item(0, VCOL_SELECT)
+            self.assertIsNotNone(select_item)
+            assert select_item is not None
+            select_item.setCheckState(Qt.CheckState.Checked)
+
+            self.assertTrue(hasattr(panel, "_do_not_replace"))
+            self.assertTrue(panel._do_not_replace.isChecked())
+            self.assertFalse(panel._do_not_replace.isEnabled())
+            self.assertTrue(panel._convert_button.isEnabled())
+        finally:
+            panel.close()
+
+    def test_images_panel_uses_type_and_recommended_extension(self):
+        panel = MediaPanel("Images")
+        try:
+            image_path = "C:/tmp/picture.PNG"
+            panel.add_file(image_path, 2048, "1")
+
+            header_type = panel._table.horizontalHeaderItem(VCOL_CODEC)
+            self.assertIsNotNone(header_type)
+            assert header_type is not None
+            self.assertEqual(header_type.text(), "Type")
+
+            type_item = panel._table.item(0, VCOL_CODEC)
+            recommend_item = panel._table.item(0, VCOL_REC)
+            self.assertIsNotNone(type_item)
+            self.assertIsNotNone(recommend_item)
+            assert type_item is not None
+            assert recommend_item is not None
+            self.assertEqual(type_item.text(), ".png")
+            self.assertEqual(recommend_item.text(), ".webp")
+
+            panel.update_probes([(image_path, {"video_codec": "h264"})])
+
+            updated_type_item = panel._table.item(0, VCOL_CODEC)
+            updated_recommend_item = panel._table.item(0, VCOL_REC)
+            self.assertIsNotNone(updated_type_item)
+            self.assertIsNotNone(updated_recommend_item)
+            assert updated_type_item is not None
+            assert updated_recommend_item is not None
+            self.assertEqual(updated_type_item.text(), ".png")
+            self.assertEqual(updated_recommend_item.text(), ".webp")
+        finally:
+            panel.close()
 
 
 if __name__ == "__main__":

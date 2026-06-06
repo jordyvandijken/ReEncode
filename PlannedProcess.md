@@ -137,11 +137,20 @@ converting remains separate from scan state machine
 
 
 ## Tables
-The tables Images, Videos and Audio have the following columns:
-Name, Size, Codec, Recommend, Estimate, Modified
+The Videos and Audio tables have the following columns:
+Select, Name, Size, Codec, Recommend, Estimate, Modified
+
+The Images table has the following columns:
+Select, Name, Size, Type, Recommend, Estimate, Modified
+
+For Images:
+- Type is the source file extension (for example `.png`)
+- Recommend is the recommended target extension (`.webp`)
+
+Each media table supports selecting rows and converting selected items.
 
 The table Failed will contain the Columns:
-Name, reason failure, obsolute Path
+Name, reason failure, absolute Path
 
 ## StateMachine States
 - idle

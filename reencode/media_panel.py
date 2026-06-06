@@ -97,7 +97,10 @@ class _NumericItem(QTableWidgetItem):
 
 
 BASE_COLUMNS = ["Name", "Size", "Codec", "Recommend", "Estimate", "Path", "Modified"]
-VIDEO_COLUMNS = ["", "Name", "Size", "Codec", "Recommended", "Estimate", "Path", "Modified"]
+SELECTABLE_COLUMNS = ["", "Name", "Size", "Codec", "Recommended", "Estimate", "Path", "Modified"]
+IMAGE_BASE_COLUMNS = ["Name", "Size", "Type", "Recommend", "Estimate", "Path", "Modified"]
+IMAGE_SELECTABLE_COLUMNS = ["", "Name", "Size", "Type", "Recommend", "Estimate", "Path", "Modified"]
+CONVERTIBLE_MEDIA_TYPES = {"Videos", "Audio", "Images"}
 
 COL_NAME, COL_SIZE, COL_CODEC, COL_REC, COL_ESTIMATE, COL_PATH, COL_MODIFIED = range(7)
 VCOL_SELECT, VCOL_NAME, VCOL_SIZE, VCOL_CODEC, VCOL_REC, VCOL_ESTIMATE, VCOL_PATH, VCOL_MODIFIED = range(8)
@@ -108,6 +111,12 @@ _COLOR_GOOD     = QColor("#1565c0")   # dark blue
 _COLOR_REENCODE = QColor("#e65100")   # dark orange
 _COLOR_PENDING  = QColor("#616161")   # neutral gray
 _PAGE_SIZE_OPTIONS = (25, 50, 100, 250)
+
+
+def _columns_for_media_type(media_type: str, supports_conversion: bool) -> list[str]:
+    if media_type == "Images":
+        return IMAGE_SELECTABLE_COLUMNS if supports_conversion else IMAGE_BASE_COLUMNS
+    return SELECTABLE_COLUMNS if supports_conversion else BASE_COLUMNS
 
 
 def _recommended_ffmpeg_args(recommended_label: str) -> list[str]:
@@ -121,7 +130,15 @@ def _recommended_ffmpeg_args(recommended_label: str) -> list[str]:
     return ["-c:v", "libx265", "-crf", "28", "-preset", "medium"]
 
 
-def _recommended_output_path(path: str, recommended_label: str) -> str:
+def _recommended_audio_ffmpeg_args() -> list[str]:
+    return ["-c:a", "aac", "-b:a", "192k"]
+
+
+def _recommended_image_ffmpeg_args() -> list[str]:
+    return ["-c:v", "libwebp", "-quality", "80"]
+
+
+def _recommended_video_output_path(path: str, recommended_label: str) -> str:
     source = Path(path)
     suffix = source.suffix.lower()
     output_suffix = suffix if suffix in {".mkv", ".webm"} else ".mkv"
@@ -139,6 +156,44 @@ def _recommended_output_path(path: str, recommended_label: str) -> str:
         index += 1
 
 
+def _recommended_audio_output_path(path: str) -> str:
+    source = Path(path)
+    candidate = source.with_name(f"{source.stem}.reencoded.m4a")
+
+    if not candidate.exists():
+        return str(candidate)
+
+    index = 2
+    while True:
+        next_candidate = source.with_name(f"{source.stem}.reencoded-{index}.m4a")
+        if not next_candidate.exists():
+            return str(next_candidate)
+        index += 1
+
+
+def _recommended_image_output_path(path: str) -> str:
+    source = Path(path)
+    candidate = source.with_name(f"{source.stem}.reencoded.webp")
+
+    if not candidate.exists():
+        return str(candidate)
+
+    index = 2
+    while True:
+        next_candidate = source.with_name(f"{source.stem}.reencoded-{index}.webp")
+        if not next_candidate.exists():
+            return str(next_candidate)
+        index += 1
+
+
+def _recommended_output_path(media_type: str, path: str, recommended_label: str) -> str:
+    if media_type == "Videos":
+        return _recommended_video_output_path(path, recommended_label)
+    if media_type == "Audio":
+        return _recommended_audio_output_path(path)
+    return _recommended_image_output_path(path)
+
+
 def _temporary_output_path(final_output_path: str) -> str:
     final_output = Path(final_output_path)
     suffix = final_output.suffix or ".mkv"
@@ -151,23 +206,38 @@ class _ConversionThread(QThread):
     progress = Signal(str, int, int, object)
     finished = Signal(bool, str)
 
-    def __init__(self, jobs: list[tuple[str, str]], replace_originals: bool, parent=None):
+    def __init__(self, jobs: list[tuple[str, str, str, str]], replace_originals: bool, parent=None):
         super().__init__(parent)
         self._jobs = jobs
         self._replace_originals = replace_originals
 
+    def _job_conversion_inputs(self, media_type: str, source_path: str, recommended_label: str) -> tuple[list[str], float | None]:
+        probe_info = codec_probe.probe_media_info(source_path) or {}
+
+        if media_type == "Videos":
+            codec_name = (probe_info.get("video_codec") or "").lower()
+            if not recommended_label:
+                _status, recommended_label, _reason = codec_probe.recommendation(codec_name)
+            ffmpeg_args = _recommended_ffmpeg_args(recommended_label)
+            duration_seconds = probe_info.get("duration")
+        elif media_type == "Audio":
+            ffmpeg_args = _recommended_audio_ffmpeg_args()
+            duration_seconds = probe_info.get("duration")
+        else:
+            ffmpeg_args = _recommended_image_ffmpeg_args()
+            duration_seconds = None
+
+        if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+            duration_seconds = None
+
+        return ffmpeg_args, duration_seconds
+
     def run(self):
         total_jobs = len(self._jobs)
 
-        for job_index, (source_path, final_output_path) in enumerate(self._jobs, start=1):
+        for job_index, (media_type, source_path, final_output_path, recommended_label) in enumerate(self._jobs, start=1):
             temp_output_path = _temporary_output_path(final_output_path)
-            probe_info = codec_probe.probe_media_info(source_path) or {}
-            codec_name = (probe_info.get("video_codec") or "").lower()
-            _status, recommended_label, _reason = codec_probe.recommendation(codec_name)
-            ffmpeg_args = _recommended_ffmpeg_args(recommended_label)
-            duration_seconds = probe_info.get("duration")
-            if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
-                duration_seconds = None
+            ffmpeg_args, duration_seconds = self._job_conversion_inputs(media_type, source_path, recommended_label)
 
             command = [
                 "ffmpeg",
@@ -180,15 +250,32 @@ class _ConversionThread(QThread):
                 "-nostats",
                 "-i",
                 source_path,
-                "-map",
-                "0",
-                *ffmpeg_args,
-                "-c:a",
-                "copy",
-                "-c:s",
-                "copy",
-                temp_output_path,
             ]
+
+            if media_type == "Videos":
+                command.extend([
+                    "-map",
+                    "0",
+                    *ffmpeg_args,
+                    "-c:a",
+                    "copy",
+                    "-c:s",
+                    "copy",
+                    temp_output_path,
+                ])
+            elif media_type == "Audio":
+                command.extend([
+                    "-vn",
+                    *ffmpeg_args,
+                    temp_output_path,
+                ])
+            else:
+                command.extend([
+                    "-frames:v",
+                    "1",
+                    *ffmpeg_args,
+                    temp_output_path,
+                ])
 
             try:
                 process = subprocess.Popen(
@@ -280,6 +367,7 @@ class MediaPanel(QWidget):
             not self._is_video
             and os.getenv("REENCODE_VIRTUAL_AUDIO_TABLE", "0").strip().lower() in {"1", "true", "yes", "on"}
         )
+        self._supports_conversion = media_type in CONVERTIBLE_MEDIA_TYPES and not self._use_virtual_table
         self._conversion_thread: _ConversionThread | None = None
         self._probe_updates_active = False
         self._scan_locked = False
@@ -328,7 +416,7 @@ class MediaPanel(QWidget):
         self._page_label = QLabel("Page 0 of 0")
         top_bar.addWidget(self._page_label)
 
-        if self._is_video:
+        if self._supports_conversion:
             self._select_all = QCheckBox("Select all")
             self._select_all.setTristate(True)
             self._select_all.stateChanged.connect(self._on_select_all_changed)
@@ -346,10 +434,7 @@ class MediaPanel(QWidget):
 
         layout.addLayout(top_bar)
 
-        if self._is_video:
-            columns = VIDEO_COLUMNS
-        else:
-            columns = BASE_COLUMNS
+        columns = _columns_for_media_type(self._media_type, self._supports_conversion)
 
         if self._use_virtual_table:
             self._virtual_model = VirtualMediaTableModel(columns, parent=self)
@@ -359,7 +444,7 @@ class MediaPanel(QWidget):
             self._table = QTableWidget(0, len(columns))
             self._table.setHorizontalHeaderLabels(columns)
 
-        if self._is_video:
+        if self._supports_conversion:
             self._table.horizontalHeader().setSectionResizeMode(VCOL_SELECT,    QHeaderView.ResizeMode.ResizeToContents)
             self._table.horizontalHeader().setSectionResizeMode(VCOL_NAME,      QHeaderView.ResizeMode.ResizeToContents)
             self._table.horizontalHeader().setSectionResizeMode(VCOL_SIZE,      QHeaderView.ResizeMode.ResizeToContents)
@@ -386,17 +471,17 @@ class MediaPanel(QWidget):
         if not self._use_virtual_table:
             self._table.horizontalHeader().sortIndicatorChanged.connect(self._invalidate_path_rows)
         # Keep path data in the model for internal lookups, but hide it from the UI.
-        self._table.setColumnHidden(VCOL_PATH if self._is_video else COL_PATH, True)
-        if self._is_video and not self._use_virtual_table:
+        self._table.setColumnHidden(self._path_column(), True)
+        if self._supports_conversion and not self._use_virtual_table:
             self._table.itemChanged.connect(self._on_table_item_changed)
         layout.addWidget(self._table)
 
         self._apply_pagination(save_settings=False)
-        if self._is_video:
-            self._refresh_video_controls()
+        if self._supports_conversion:
+            self._refresh_selection_controls()
 
     def _on_select_all_changed(self, state: int):
-        if not self._is_video or self._suspend_check_updates:
+        if not self._supports_conversion or self._suspend_check_updates:
             return
 
         if state == Qt.CheckState.PartiallyChecked.value:
@@ -412,19 +497,19 @@ class MediaPanel(QWidget):
         finally:
             self._suspend_check_updates = False
 
-        self._refresh_video_controls()
+        self._refresh_selection_controls()
 
     def _on_table_item_changed(self, item: QTableWidgetItem):
-        if not self._is_video or self._suspend_check_updates:
+        if not self._supports_conversion or self._suspend_check_updates:
             return
 
         if self._table.indexFromItem(item).column() != VCOL_SELECT:
             return
 
-        self._refresh_video_controls()
+        self._refresh_selection_controls()
 
-    def _refresh_video_controls(self):
-        if not self._is_video:
+    def _refresh_selection_controls(self):
+        if not self._supports_conversion:
             return
 
         total = self._table.rowCount()
@@ -449,7 +534,11 @@ class MediaPanel(QWidget):
 
         enabled = not self._scan_locked and self._conversion_thread is None
         self._convert_button.setEnabled(selected > 0 and enabled)
-        self._do_not_replace.setEnabled(total > 0 and enabled)
+        if self._media_type == "Images":
+            self._do_not_replace.setChecked(True)
+            self._do_not_replace.setEnabled(False)
+        else:
+            self._do_not_replace.setEnabled(total > 0 and enabled)
         self._select_all.setEnabled(total > 0 and enabled)
         self._refresh_pagination_controls()
         self._update_label()
@@ -551,8 +640,8 @@ class MediaPanel(QWidget):
                 selected += 1
         return selected
 
-    def _selected_video_jobs(self, replace_originals: bool) -> list[tuple[str, str]]:
-        jobs: list[tuple[str, str]] = []
+    def _selected_jobs(self, replace_originals: bool) -> list[tuple[str, str, str, str]]:
+        jobs: list[tuple[str, str, str, str]] = []
         for row in range(self._table.rowCount()):
             select_item = self._table.item(row, VCOL_SELECT)
             if select_item is None or select_item.checkState() != Qt.CheckState.Checked:
@@ -564,17 +653,17 @@ class MediaPanel(QWidget):
                 continue
 
             source_path = path_item.text()
-            if replace_originals:
+            if replace_originals and self._media_type != "Images":
                 final_output_path = source_path
             else:
-                final_output_path = _recommended_output_path(source_path, rec_item.text())
+                final_output_path = _recommended_output_path(self._media_type, source_path, rec_item.text())
 
-            jobs.append((source_path, final_output_path))
+            jobs.append((self._media_type, source_path, final_output_path, rec_item.text()))
 
         return jobs
 
     def _path_column(self) -> int:
-        return VCOL_PATH if self._is_video else COL_PATH
+        return VCOL_PATH if self._supports_conversion else COL_PATH
 
     def _invalidate_path_rows(self, *_args):
         self._path_rows_dirty = True
@@ -699,8 +788,8 @@ class MediaPanel(QWidget):
             estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
             return estimate_text, estimate_bytes
 
-    def _base_codec_recommend_items(self, probe_info: dict | None):
-        codec_text, rec_label, reason, status = self._base_codec_recommend_values(probe_info)
+    def _base_codec_recommend_items(self, path: str, probe_info: dict | None):
+        codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
 
         codec_item = QTableWidgetItem(codec_text)
         rec_item = QTableWidgetItem(rec_label)
@@ -719,7 +808,14 @@ class MediaPanel(QWidget):
 
         return codec_item, rec_item
 
-    def _base_codec_recommend_values(self, probe_info: dict | None) -> tuple[str, str, str, str]:
+    def _base_codec_recommend_values(self, path: str, probe_info: dict | None) -> tuple[str, str, str, str]:
+        if self._media_type == "Images":
+            file_ext = os.path.splitext(path)[1].lower()
+            if file_ext:
+                status = "optimal" if file_ext == ".webp" else "good"
+                return file_ext, ".webp", "Images convert to .webp by default.", status
+            return "Unknown", ".webp", "File extension could not be determined.", "pending"
+
         if self._media_type == "Audio":
             raw_codec = (probe_info or {}).get("audio_codec")
             if raw_codec:
@@ -741,7 +837,7 @@ class MediaPanel(QWidget):
         return codec_text, rec_label, reason, status
 
     def _virtual_row(self, path: str, size_bytes: int, modified_timestamp: str, probe_info: dict | None) -> dict:
-        codec_text, rec_label, reason, status = self._base_codec_recommend_values(probe_info)
+        codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
         estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
         return {
             "name": os.path.basename(path),
@@ -762,9 +858,11 @@ class MediaPanel(QWidget):
             return
 
         replace_originals = not self._do_not_replace.isChecked()
-        jobs = self._selected_video_jobs(replace_originals)
+        if self._media_type == "Images":
+            replace_originals = False
+        jobs = self._selected_jobs(replace_originals)
         if not jobs:
-            QMessageBox.information(self, "Convert selected", "Select at least one video first.")
+            QMessageBox.information(self, "Convert selected", "Select at least one file first.")
             return
 
         self._suspend_check_updates = True
@@ -842,8 +940,28 @@ class MediaPanel(QWidget):
             self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
             self._table.setItem(row, VCOL_PATH, path_item)
             self._table.setItem(row, VCOL_MODIFIED, modified_item)
+        elif self._supports_conversion:
+            codec_item, rec_item = self._base_codec_recommend_items(path, None)
+            estimate_item = self._audio_estimate_item(path, size_bytes, None)
+
+            select_item = QTableWidgetItem()
+            select_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
+            select_item.setCheckState(Qt.CheckState.Unchecked)
+            select_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            for item in (name_item, size_item, codec_item, rec_item, estimate_item, path_item, modified_item):
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            self._table.setItem(row, VCOL_SELECT, select_item)
+            self._table.setItem(row, VCOL_NAME, name_item)
+            self._table.setItem(row, VCOL_SIZE, size_item)
+            self._table.setItem(row, VCOL_CODEC, codec_item)
+            self._table.setItem(row, VCOL_REC, rec_item)
+            self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
+            self._table.setItem(row, VCOL_PATH, path_item)
+            self._table.setItem(row, VCOL_MODIFIED, modified_item)
         else:
-            codec_item, rec_item = self._base_codec_recommend_items(None)
+            codec_item, rec_item = self._base_codec_recommend_items(path, None)
             estimate_item = self._audio_estimate_item(path, size_bytes, None)
 
             for item in (name_item, size_item, codec_item, rec_item, estimate_item, path_item, modified_item):
@@ -884,8 +1002,8 @@ class MediaPanel(QWidget):
         self._invalidate_path_rows()
         self._apply_pagination(save_settings=False)
         self._update_label()
-        if self._is_video:
-            self._refresh_video_controls()
+        if self._supports_conversion:
+            self._refresh_selection_controls()
 
     def add_files(self, rows: list[tuple[str, int, str]]):
         if not rows:
@@ -912,8 +1030,8 @@ class MediaPanel(QWidget):
         self._invalidate_path_rows()
         self._apply_pagination(save_settings=False)
         self._update_label()
-        if self._is_video:
-            self._refresh_video_controls()
+        if self._supports_conversion:
+            self._refresh_selection_controls()
 
     def update_probe(self, path: str, probe_info: dict | None):
         self.update_probes([(path, probe_info)])
@@ -966,7 +1084,7 @@ class MediaPanel(QWidget):
                 modified_item = QTableWidgetItem(self._format_modified(modified_timestamp))
                 modified_item.setFlags(modified_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-                if self._is_video:
+                if self._supports_conversion:
                     self._table.setItem(row, VCOL_SIZE, size_item)
                     self._table.setItem(row, VCOL_MODIFIED, modified_item)
                 else:
@@ -1018,7 +1136,7 @@ class MediaPanel(QWidget):
                 size_bytes = self._virtual_model.size_for_path(path)
                 if size_bytes is None:
                     continue
-                codec_text, rec_label, reason, status = self._base_codec_recommend_values(probe_info)
+                codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
                 estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
                 row_updates[path] = {
                     "codec": codec_text,
@@ -1055,7 +1173,7 @@ class MediaPanel(QWidget):
         if row is None:
             return
 
-        size_item = self._table.item(row, VCOL_SIZE if self._is_video else COL_SIZE)
+        size_item = self._table.item(row, VCOL_SIZE if self._supports_conversion else COL_SIZE)
         if size_item is None:
             return
 
@@ -1066,8 +1184,14 @@ class MediaPanel(QWidget):
             self._table.setItem(row, VCOL_CODEC, codec_item)
             self._table.setItem(row, VCOL_REC, rec_item)
             self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
+        elif self._supports_conversion:
+            codec_item, rec_item = self._base_codec_recommend_items(path, probe_info)
+            self._table.setItem(row, VCOL_CODEC, codec_item)
+            self._table.setItem(row, VCOL_REC, rec_item)
+            estimate_item = self._audio_estimate_item(path, size_bytes, probe_info)
+            self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
         else:
-            codec_item, rec_item = self._base_codec_recommend_items(probe_info)
+            codec_item, rec_item = self._base_codec_recommend_items(path, probe_info)
             self._table.setItem(row, COL_CODEC, codec_item)
             self._table.setItem(row, COL_REC, rec_item)
             estimate_item = self._audio_estimate_item(path, size_bytes, probe_info)
@@ -1090,8 +1214,8 @@ class MediaPanel(QWidget):
         self._pagination_page = 0
         self._apply_pagination(save_settings=True)
         self._update_label()
-        if self._is_video:
-            self._refresh_video_controls()
+        if self._supports_conversion:
+            self._refresh_selection_controls()
 
     def file_count(self) -> int:
         if self._use_virtual_table:
@@ -1101,8 +1225,8 @@ class MediaPanel(QWidget):
 
     def set_scan_locked(self, locked: bool):
         self._scan_locked = locked
-        if self._is_video:
-            self._refresh_video_controls()
+        if self._supports_conversion:
+            self._refresh_selection_controls()
 
     def _is_row_visible(self, row: int) -> bool:
         visible_bounds = self._visible_row_bounds()
@@ -1169,7 +1293,7 @@ class MediaPanel(QWidget):
             self._label.setText("No files found yet.")
         else:
             noun = "file" if count == 1 else "files"
-            if self._is_video:
+            if self._supports_conversion:
                 selected = self._selected_row_count()
                 self._label.setText(f"{count} {noun} ({selected} selected)")
             else:
