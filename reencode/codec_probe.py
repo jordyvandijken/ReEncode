@@ -4,6 +4,8 @@ import json
 import subprocess
 from functools import lru_cache
 
+from reencode.subprocess_util import run_hidden
+
 
 def _to_int(value) -> int | None:
     try:
@@ -99,7 +101,7 @@ def probe_media_info(path: str) -> dict | None:
     Returns None if ffprobe is unavailable or response is invalid.
     """
     try:
-        result = subprocess.run(
+        result = run_hidden(
             [
                 "ffprobe",
                 "-v", "quiet",

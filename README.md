@@ -60,6 +60,15 @@ ffprobe -version
 python main.py
 ```
 
+## Build App (Windows)
+
+```powershell
+python -m pip install -r requirements-build.txt
+python -m PyInstaller --noconfirm --clean ReEncode.spec
+```
+
+Output is created as `dist\ReEncode.exe`.
+
 ## Use
 
 1. Add folder(s) in Sources.

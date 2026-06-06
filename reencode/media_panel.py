@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from reencode import codec_probe
 from reencode import size_estimator
+from reencode.subprocess_util import popen_hidden
 from reencode.virtual_media_model import VirtualMediaTableModel, recommendation_color
 
 
@@ -278,7 +279,7 @@ class _ConversionThread(QThread):
                 ])
 
             try:
-                process = subprocess.Popen(
+                process = popen_hidden(
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
