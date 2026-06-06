@@ -371,6 +371,7 @@ class MediaPanel(QWidget):
         self._conversion_thread: _ConversionThread | None = None
         self._probe_updates_active = False
         self._scan_locked = False
+        self._default_selection_mode: QAbstractItemView.SelectionMode | None = None
         self._path_rows: dict[str, int] = {}
         self._path_rows_dirty = False
         self._virtual_model: VirtualMediaTableModel | None = None
@@ -468,6 +469,7 @@ class MediaPanel(QWidget):
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
+        self._default_selection_mode = self._table.selectionMode()
         if not self._use_virtual_table:
             self._table.horizontalHeader().sortIndicatorChanged.connect(self._invalidate_path_rows)
         # Keep path data in the model for internal lookups, but hide it from the UI.
@@ -602,6 +604,10 @@ class MediaPanel(QWidget):
             return
 
         self._page_label.setText(f"Page {self._pagination_page + 1} of {total_pages}")
+        if self._scan_locked:
+            self._prev_page_button.setEnabled(False)
+            self._next_page_button.setEnabled(False)
+            return
         self._prev_page_button.setEnabled(self._pagination_page > 0)
         self._next_page_button.setEnabled(self._pagination_page + 1 < total_pages)
 
@@ -1227,6 +1233,13 @@ class MediaPanel(QWidget):
         self._scan_locked = locked
         if self._supports_conversion:
             self._refresh_selection_controls()
+        self._page_size_combo.setEnabled(not locked)
+        if locked:
+            self._table.clearSelection()
+            self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        elif self._default_selection_mode is not None:
+            self._table.setSelectionMode(self._default_selection_mode)
+        self._refresh_pagination_controls()
 
     def _is_row_visible(self, row: int) -> bool:
         visible_bounds = self._visible_row_bounds()
@@ -1306,6 +1319,8 @@ class FailedPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._settings = QSettings()
+        self._scan_locked = False
+        self._default_selection_mode: QAbstractItemView.SelectionMode | None = None
         self._pagination_settings_prefix = "pagination/failed"
         self._pagination_page_size = self._load_page_size_setting()
         self._pagination_page = self._load_page_setting()
@@ -1357,6 +1372,7 @@ class FailedPanel(QWidget):
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
+        self._default_selection_mode = self._table.selectionMode()
         layout.addWidget(self._table)
         self._apply_pagination(save_settings=False)
 
@@ -1413,6 +1429,10 @@ class FailedPanel(QWidget):
             return
 
         self._page_label.setText(f"Page {self._pagination_page + 1} of {total_pages}")
+        if self._scan_locked:
+            self._prev_page_button.setEnabled(False)
+            self._next_page_button.setEnabled(False)
+            return
         self._prev_page_button.setEnabled(self._pagination_page > 0)
         self._next_page_button.setEnabled(self._pagination_page + 1 < total_pages)
 
@@ -1466,6 +1486,16 @@ class FailedPanel(QWidget):
         self._pagination_page = 0
         self._apply_pagination(save_settings=True)
         self._update_label()
+
+    def set_scan_locked(self, locked: bool):
+        self._scan_locked = locked
+        self._page_size_combo.setEnabled(not locked)
+        if locked:
+            self._table.clearSelection()
+            self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        elif self._default_selection_mode is not None:
+            self._table.setSelectionMode(self._default_selection_mode)
+        self._refresh_pagination_controls()
 
     def file_count(self) -> int:
         return self._table.rowCount()

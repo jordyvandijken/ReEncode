@@ -6,7 +6,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QAbstractItemView
 
 from reencode.media_panel import FailedPanel, MediaPanel, VCOL_CODEC, VCOL_REC, VCOL_SELECT
 
@@ -119,6 +119,20 @@ class MediaPanelPathIndexTests(unittest.TestCase):
         assert hidden_row is not None
         self.assertTrue(self.panel._table.isRowHidden(hidden_row))
 
+    def test_scan_lock_disables_table_and_pagination_controls(self):
+        self.panel.add_file("C:/tmp/locked.mp4", 100, "1")
+
+        self.panel.set_scan_locked(True)
+        self.assertTrue(self.panel._table.isEnabled())
+        self.assertFalse(self.panel._page_size_combo.isEnabled())
+        self.assertFalse(self.panel._prev_page_button.isEnabled())
+        self.assertFalse(self.panel._next_page_button.isEnabled())
+        self.assertEqual(self.panel._table.selectionMode(), QAbstractItemView.SelectionMode.NoSelection)
+
+        self.panel.set_scan_locked(False)
+        self.assertTrue(self.panel._table.isEnabled())
+        self.assertTrue(self.panel._page_size_combo.isEnabled())
+
 
 class FailedPanelPaginationTests(unittest.TestCase):
     @classmethod
@@ -156,6 +170,20 @@ class FailedPanelPaginationTests(unittest.TestCase):
             row for row in range(self.panel._table.rowCount()) if not self.panel._table.isRowHidden(row)
         ]
         self.assertEqual(len(visible_second_page), 15)
+
+    def test_failed_panel_scan_lock_disables_table_and_pagination(self):
+        self.panel.add_failures([("bad.mp4", "probe failed", "C:/tmp/bad.mp4")])
+
+        self.panel.set_scan_locked(True)
+        self.assertTrue(self.panel._table.isEnabled())
+        self.assertFalse(self.panel._page_size_combo.isEnabled())
+        self.assertFalse(self.panel._prev_page_button.isEnabled())
+        self.assertFalse(self.panel._next_page_button.isEnabled())
+        self.assertEqual(self.panel._table.selectionMode(), QAbstractItemView.SelectionMode.NoSelection)
+
+        self.panel.set_scan_locked(False)
+        self.assertTrue(self.panel._table.isEnabled())
+        self.assertTrue(self.panel._page_size_combo.isEnabled())
 
 
 class MediaPanelConversionParityTests(unittest.TestCase):

@@ -289,6 +289,7 @@ class MainWindow(QMainWindow):
             if panel in (self._panels.get("Videos"), self._panels.get("Audio")):
                 panel.begin_probe_updates()
         self._failed_panel.clear()
+        self._failed_panel.set_scan_locked(True)
 
         self._total_found = 0
         self._discovery_count = 0
@@ -644,6 +645,7 @@ class MainWindow(QMainWindow):
         self._sources_panel.set_scanning(False)
         for panel in self._panels.values():
             panel.set_scan_locked(False)
+        self._failed_panel.set_scan_locked(False)
 
         noun = "file" if discovered_count == 1 else "files"
         failed_count = self._failed_panel.file_count()

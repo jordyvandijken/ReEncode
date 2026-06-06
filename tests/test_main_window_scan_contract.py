@@ -326,6 +326,16 @@ class MainWindowScanContractTests(unittest.TestCase):
         self.assertEqual(self.window._sources_panel._btn_scan.text(), "Scan")
         self.assertIn("cancelled", self.window._status_bar.currentMessage())
 
+    def test_finalize_scan_unlocks_failed_panel(self):
+        self.window._failed_panel.set_scan_locked(True)
+
+        self.window._active_source_roots = [self._tmp.name]
+        self.window._worker_cancelled = False
+        self.window._finalize_scan(discovered_count=0, probed_count=0)
+
+        self.assertFalse(self.window._failed_panel._scan_locked)
+        self.assertTrue(self.window._failed_panel._table.isEnabled())
+
 
 if __name__ == "__main__":
     unittest.main()
