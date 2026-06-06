@@ -395,6 +395,7 @@ class MediaPanel(QWidget):
 
         self._convert_button.setEnabled(selected > 0 and self._conversion_thread is None)
         self._do_not_replace.setEnabled(total > 0 and self._conversion_thread is None)
+        self._update_label()
 
     def _selected_row_count(self) -> int:
         selected = 0
@@ -647,4 +648,8 @@ class MediaPanel(QWidget):
             self._label.setText("No files found yet.")
         else:
             noun = "file" if count == 1 else "files"
-            self._label.setText(f"{count} {noun}")
+            if self._is_video:
+                selected = self._selected_row_count()
+                self._label.setText(f"{count} {noun} ({selected} selected)")
+            else:
+                self._label.setText(f"{count} {noun}")
