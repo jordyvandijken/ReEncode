@@ -2,6 +2,7 @@ import os
 from queue import Queue
 from time import perf_counter
 import math
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, Signal, QTimer
@@ -152,7 +153,7 @@ class _MetadataProbeWorker(QThread):
                         media_type=media_type,
                         file_size=size_bytes,
                         last_modified=modified_int,
-                        scan_id=self._scan_id,
+                        scanned_at=int(time.time()),
                         encoding=encoding,
                         probe=probe_info,
                         commit=False,
@@ -233,6 +234,7 @@ class MainWindow(QMainWindow):
         self._status_timer.timeout.connect(self._refresh_scan_status)
 
         self._scan_started_at: float | None = None
+        self._scan_started_at_epoch: int | None = None
 
         self._setup_ui()
 
@@ -311,6 +313,7 @@ class MainWindow(QMainWindow):
         self._discovered_files = []
         self._metadata_processed = 0
         self._scan_started_at = perf_counter()
+        self._scan_started_at_epoch = int(time.time())
 
         self._sources_panel.set_scanning(True)
         self._status_bar.showMessage("Scanning…")
@@ -392,7 +395,7 @@ class MainWindow(QMainWindow):
                 media_type=media_type,
                 file_size=0,
                 last_modified=0,
-                scan_id=self._scan_token,
+                scanned_at=int(time.time()),
                 commit=True,
             )
         except Exception as exc:
@@ -685,7 +688,8 @@ class MainWindow(QMainWindow):
         return self._active_source_roots[0] if self._active_source_roots else normalized
 
     def _finalize_scan(self, discovered_count: int, probed_count: int):
-        pruned = self._scan_store.prune_scan_scope(self._active_source_roots, self._scan_token)
+        scan_started_at = self._scan_started_at_epoch if self._scan_started_at_epoch is not None else int(time.time())
+        pruned = self._scan_store.prune_scan_scope(self._active_source_roots, scan_started_at)
         elapsed_text = self._format_duration(self._scan_elapsed_seconds())
 
         self._scan_state = ScanState.IDLE
@@ -706,6 +710,7 @@ class MainWindow(QMainWindow):
             f"Time: {elapsed_text}."
         )
         self._scan_started_at = None
+        self._scan_started_at_epoch = None
 
     def _on_conversion_status_changed(self, message: str, active: bool):
         if active:

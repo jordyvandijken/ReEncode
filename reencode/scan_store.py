@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,10 @@ def _normalize_path(path: str) -> str:
 
 
 class ScanStore:
-    """SQLite-backed storage for scan records and probe reuse decisions."""
+    """SQLite-backed storage for scan records and probe reuse decisions.
+
+    `last_scanned` is persisted as a Unix timestamp in seconds.
+    """
 
     def __init__(self, db_path: Path | None = None):
         self._db_path = db_path or _default_db_path()
@@ -57,6 +61,17 @@ class ScanStore:
             """
             CREATE INDEX IF NOT EXISTS idx_scan_records_media_type
             ON scan_records (media_type)
+            """
+        )
+        # Migrate legacy scan-token values (for example 1, 2, 3) to comparable timestamps.
+        self._conn.execute(
+            """
+            UPDATE scan_records
+            SET last_scanned = CASE
+                WHEN last_modified > 0 THEN last_modified
+                ELSE CAST(strftime('%s','now') AS INTEGER)
+            END
+            WHERE last_scanned < 946684800
             """
         )
         self._conn.commit()
@@ -120,7 +135,7 @@ class ScanStore:
         media_type: str,
         file_size: int,
         last_modified: int,
-        scan_id: int,
+        scanned_at: int | float | None = None,
         encoding: str | None = None,
         probe: dict | None = None,
         commit: bool = True,
@@ -128,6 +143,7 @@ class ScanStore:
         normalized_path = _normalize_path(absolute_path)
         normalized_root = _normalize_path(source_root)
         probe_json = json.dumps(probe, ensure_ascii=True, separators=(",", ":")) if probe else None
+        scanned_at_value = int(scanned_at if scanned_at is not None else time.time())
 
         self._conn.execute(
             """
@@ -158,24 +174,24 @@ class ScanStore:
                 int(last_modified),
                 encoding,
                 probe_json,
-                int(scan_id),
+                scanned_at_value,
             ),
         )
         if commit:
             self._conn.commit()
 
-    def prune_scan_scope(self, source_roots: list[str], scan_id: int) -> int:
+    def prune_scan_scope(self, source_roots: list[str], scan_started_at: int | float) -> int:
         roots = [_normalize_path(root) for root in source_roots]
         if not roots:
             return 0
 
         placeholders = ",".join("?" for _ in roots)
-        params = [*roots, int(scan_id)]
+        params = [*roots, int(scan_started_at)]
         cursor = self._conn.execute(
             f"""
             DELETE FROM scan_records
             WHERE source_root IN ({placeholders})
-            AND last_scanned != ?
+            AND last_scanned < ?
             """,
             params,
         )

@@ -25,7 +25,7 @@ class ScanStoreTests(unittest.TestCase):
                     media_type="Videos",
                     file_size=100,
                     last_modified=10,
-                    scan_id=1,
+                    scanned_at=100,
                     encoding="h264",
                     probe={"video_codec": "h264"},
                 )
@@ -35,7 +35,7 @@ class ScanStoreTests(unittest.TestCase):
                     media_type="Videos",
                     file_size=101,
                     last_modified=11,
-                    scan_id=2,
+                    scanned_at=200,
                     encoding="h265",
                     probe={"video_codec": "hevc"},
                 )
@@ -45,12 +45,12 @@ class ScanStoreTests(unittest.TestCase):
                     media_type="Audio",
                     file_size=12,
                     last_modified=12,
-                    scan_id=1,
+                    scanned_at=100,
                     encoding="aac",
                     probe={"audio_codec": "aac"},
                 )
 
-                removed = store.prune_scan_scope([root_a], scan_id=2)
+                removed = store.prune_scan_scope([root_a], scan_started_at=150)
 
                 self.assertEqual(removed, 1)
                 self.assertIsNone(store.get_record(stale_path))

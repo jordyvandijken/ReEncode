@@ -26,7 +26,7 @@ class MetadataProbeWorkerTests(unittest.TestCase):
                     media_type="Videos",
                     file_size=stat.st_size,
                     last_modified=int(stat.st_mtime),
-                    scan_id=1,
+                    scanned_at=1,
                     encoding="h264",
                     probe={"video_codec": "h264"},
                 )

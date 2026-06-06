@@ -82,17 +82,18 @@ class MainWindowScanContractTests(unittest.TestCase):
         path = str(root / "video.mp4")
         self.window._active_source_roots = [str(root)]
 
-        self.window._on_file_found(
-            scan_token=42,
-            media_type="Videos",
-            path=path,
-        )
+        with mock.patch("reencode.main_window.time.time", return_value=1700000000):
+            self.window._on_file_found(
+                scan_token=42,
+                media_type="Videos",
+                path=path,
+            )
 
         record = self.window._scan_store.get_record(path)
         self.assertIsNotNone(record)
         assert record is not None
         self.assertEqual(record["media_type"], "Videos")
-        self.assertEqual(record["last_scanned"], 42)
+        self.assertEqual(record["last_scanned"], 1700000000)
 
     def test_failure_routing_buffers_and_flushes(self):
         bad_path = str(Path(self._tmp.name) / "bad.mp4")
@@ -275,11 +276,13 @@ class MainWindowScanContractTests(unittest.TestCase):
             media_type="Videos",
             file_size=123,
             last_modified=1,
-            scan_id=41,
+            scanned_at=1700000000,
         )
 
+        self.window._scan_started_at_epoch = 1700000001
         self.window._scan_state = ScanState.QUICKSCAN
-        self.window._on_file_found(scan_token=42, media_type="Videos", path=fresh_path)
+        with mock.patch("reencode.main_window.time.time", return_value=1700000002):
+            self.window._on_file_found(scan_token=42, media_type="Videos", path=fresh_path)
 
         with mock.patch("reencode.main_window._MetadataProbeWorker", _DummyWorker):
             self.window._on_discovery_finished(
@@ -302,7 +305,7 @@ class MainWindowScanContractTests(unittest.TestCase):
         fresh_record = self.window._scan_store.get_record(fresh_path)
         self.assertIsNotNone(fresh_record)
         assert fresh_record is not None
-        self.assertEqual(fresh_record["last_scanned"], 42)
+        self.assertEqual(fresh_record["last_scanned"], 1700000002)
         self.assertEqual(self.window._sources_panel._btn_scan.text(), "Scan")
         message = self.window._status_bar.currentMessage()
         self.assertIn("1 file found", message)

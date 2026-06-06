@@ -109,8 +109,8 @@ vDiscoveryWorker pushes found files into thread-safe queue for MetadataProbeWork
 ### Local Storage Lifecycle
 - Primary key: absolute_path.
 - Required fields: media_type, file_size, last_modified, encoding, last_scanned.
-- On success: upsert record and set last_scanned to current scan_id or scan timestamp.
-- Post-scan prune: delete records in scanned source scope not touched in current scan.
+- On success: upsert record and set last_scanned to current scan timestamp (Unix seconds).
+- Post-scan prune: delete records in scanned source scope where last_scanned is older than current scan start timestamp.
 - Probe reuse rule: unchanged file_size + last_modified means probe/encoding can be reused.
 
 ### Failure Handling
