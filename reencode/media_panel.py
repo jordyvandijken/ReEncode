@@ -10,9 +10,13 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTableView,
@@ -113,6 +117,11 @@ _COLOR_GOOD     = QColor("#1565c0")   # dark blue
 _COLOR_REENCODE = QColor("#e65100")   # dark orange
 _COLOR_PENDING  = QColor("#616161")   # neutral gray
 _PAGE_SIZE_OPTIONS = (25, 50, 100, 250)
+_FILTER_RECOMMEND_OPTIONS = (
+    ("All", "all"),
+    ("Re-encode", "reencode"),
+    ("Keep", "keep"),
+)
 
 _VIDEO_CODEC_ENCODER_ARGS: dict[str, list[str]] = {
     "av1": ["-c:v", "libaom-av1", "-crf", "32", "-b:v", "0", "-cpu-used", "6"],
@@ -202,6 +211,88 @@ def _columns_for_media_type(media_type: str, supports_conversion: bool) -> list[
     if media_type == "Images":
         return IMAGE_SELECTABLE_COLUMNS if supports_conversion else IMAGE_BASE_COLUMNS
     return SELECTABLE_COLUMNS if supports_conversion else BASE_COLUMNS
+
+
+def _estimate_change_pct(size_bytes: int, estimate_sort: float) -> float | None:
+    if size_bytes <= 0 or estimate_sort < 0:
+        return None
+    return ((float(size_bytes) - float(estimate_sort)) / float(size_bytes)) * 100.0
+
+
+def _parse_optional_float(value: str) -> float | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+class _FilterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Table filters")
+        self.setModal(False)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.name_path_edit = QLineEdit()
+        self.name_path_edit.setPlaceholderText("Contains text in name or path")
+        form.addRow("Name/path", self.name_path_edit)
+
+        self.codec_edit = QLineEdit()
+        self.codec_edit.setPlaceholderText("Contains codec text")
+        form.addRow("Codec", self.codec_edit)
+
+        self.recommend_combo = QComboBox()
+        for label, value in _FILTER_RECOMMEND_OPTIONS:
+            self.recommend_combo.addItem(label, value)
+        form.addRow("Recommendation", self.recommend_combo)
+
+        self.min_size_mb_edit = QLineEdit()
+        self.min_size_mb_edit.setPlaceholderText("Any")
+        form.addRow("Min size (MB)", self.min_size_mb_edit)
+
+        self.max_size_mb_edit = QLineEdit()
+        self.max_size_mb_edit.setPlaceholderText("Any")
+        form.addRow("Max size (MB)", self.max_size_mb_edit)
+
+        self.min_change_pct_edit = QLineEdit()
+        self.min_change_pct_edit.setPlaceholderText("Any")
+        form.addRow("Min change (%)", self.min_change_pct_edit)
+
+        self.max_change_pct_edit = QLineEdit()
+        self.max_change_pct_edit.setPlaceholderText("Any")
+        form.addRow("Max change (%)", self.max_change_pct_edit)
+
+        layout.addLayout(form)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Reset | QDialogButtonBox.StandardButton.Close)
+        self._reset_button = button_box.button(QDialogButtonBox.StandardButton.Reset)
+        button_box.rejected.connect(self.close)
+        layout.addWidget(button_box)
+
+    def as_filter_state(self) -> dict:
+        return {
+            "name_path": self.name_path_edit.text(),
+            "codec": self.codec_edit.text(),
+            "recommendation": self.recommend_combo.currentData() or "all",
+            "min_size_mb": _parse_optional_float(self.min_size_mb_edit.text()),
+            "max_size_mb": _parse_optional_float(self.max_size_mb_edit.text()),
+            "min_change_pct": _parse_optional_float(self.min_change_pct_edit.text()),
+            "max_change_pct": _parse_optional_float(self.max_change_pct_edit.text()),
+        }
+
+    def clear_fields(self):
+        self.name_path_edit.clear()
+        self.codec_edit.clear()
+        self.recommend_combo.setCurrentIndex(0)
+        self.min_size_mb_edit.clear()
+        self.max_size_mb_edit.clear()
+        self.min_change_pct_edit.clear()
+        self.max_change_pct_edit.clear()
 
 
 def _recommended_ffmpeg_args(recommended_label: str, source_codec: str | None = None) -> list[str]:
@@ -480,6 +571,9 @@ class MediaPanel(QWidget):
         self._probe_by_path: dict[str, dict | None] = {}
         self._presets_by_id = presets_data.presets_by_id(presets_data.load_presets())
         self._active_preset_id: str | None = None
+        self._filter_dialog: _FilterDialog | None = None
+        self._filter_state: dict = {}
+        self._filtered_widget_rows: list[int] = []
         self._setup_ui()
 
     def set_active_preset(self, preset_id: str | None):
@@ -521,13 +615,16 @@ class MediaPanel(QWidget):
                     probe_info,
                     recommended_label=rec_label,
                 )
+                estimate_change_pct = _estimate_change_pct(size_bytes, float(estimate_sort)) if estimate_sort >= 0 else None
                 row_updates[path] = {
                     "codec": codec_text,
                     "recommend": rec_label,
+                    "rec_status": status,
                     "rec_reason": reason,
                     "rec_color": recommendation_color(status),
                     "estimate_text": estimate_text,
                     "estimate_sort": estimate_sort,
+                    "estimate_change_pct": estimate_change_pct,
                     "estimate_tip": estimate_tip,
                 }
             self._virtual_model.update_rows(row_updates)
@@ -580,6 +677,10 @@ class MediaPanel(QWidget):
 
         self._page_label = QLabel("Page 0 of 0")
         top_bar.addWidget(self._page_label)
+
+        self._filter_button = QPushButton("Filters...")
+        self._filter_button.clicked.connect(self._show_filter_dialog)
+        top_bar.addWidget(self._filter_button)
 
         if self._supports_conversion:
             self._select_all = QCheckBox("Select all")
@@ -636,7 +737,7 @@ class MediaPanel(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._default_selection_mode = self._table.selectionMode()
         if not self._use_virtual_table:
-            self._table.horizontalHeader().sortIndicatorChanged.connect(self._invalidate_path_rows)
+            self._table.horizontalHeader().sortIndicatorChanged.connect(self._on_table_sort_changed)
         # Keep path data in the model for internal lookups, but hide it from the UI.
         self._table.setColumnHidden(self._path_column(), True)
         if self._supports_conversion and not self._use_virtual_table:
@@ -732,7 +833,7 @@ class MediaPanel(QWidget):
         self._settings.setValue(f"{self._pagination_settings_prefix}/page", int(self._pagination_page))
 
     def _total_pages(self) -> int:
-        count = self.file_count()
+        count = self._visible_file_count()
         if count <= 0:
             return 0
         return (count + self._pagination_page_size - 1) // self._pagination_page_size
@@ -751,24 +852,14 @@ class MediaPanel(QWidget):
             assert self._virtual_model is not None
             self._virtual_model.set_pagination(self._pagination_page, self._pagination_page_size)
         else:
+            self._rebuild_filtered_widget_rows()
             start = self._pagination_page * self._pagination_page_size
             end = start + self._pagination_page_size
             row_count = self._table.rowCount()
-            previous_state = self._pagination_last_state
-
-            if previous_state is None:
-                for row in range(row_count):
-                    self._table.setRowHidden(row, row < start or row >= end)
-            elif previous_state[0] == start and previous_state[1] == end:
-                previous_row_count = previous_state[2]
-                if row_count > previous_row_count:
-                    for row in range(previous_row_count, row_count):
-                        self._table.setRowHidden(row, row < start or row >= end)
-            else:
-                for row in range(row_count):
-                    self._table.setRowHidden(row, row < start or row >= end)
-
-            self._pagination_last_state = (start, end, row_count)
+            visible_rows = set(self._filtered_widget_rows[start:end])
+            for row in range(row_count):
+                self._table.setRowHidden(row, row not in visible_rows)
+            self._pagination_last_state = (start, end, len(self._filtered_widget_rows))
 
         self._refresh_pagination_controls()
         if save_settings and not self._pagination_restoring:
@@ -853,6 +944,173 @@ class MediaPanel(QWidget):
     def _invalidate_path_rows(self, *_args):
         self._path_rows_dirty = True
 
+    def _on_table_sort_changed(self, *_args):
+        self._invalidate_path_rows()
+        self._apply_pagination(save_settings=False)
+
+    def _visible_file_count(self) -> int:
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            return self._virtual_model.filtered_row_count()
+        self._rebuild_filtered_widget_rows()
+        return len(self._filtered_widget_rows)
+
+    def total_file_count(self) -> int:
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            return self._virtual_model.total_row_count()
+        return self._table.rowCount()
+
+    def _normalize_filter_state(self, filter_state: dict) -> dict:
+        normalized: dict = {}
+        name_path = str(filter_state.get("name_path") or "").strip().casefold()
+        if name_path:
+            normalized["name_path"] = name_path
+
+        codec = str(filter_state.get("codec") or "").strip().casefold()
+        if codec:
+            normalized["codec"] = codec
+
+        recommendation = str(filter_state.get("recommendation") or "all").strip().lower()
+        if recommendation in {"reencode", "keep"}:
+            normalized["recommendation"] = recommendation
+
+        min_size_mb = filter_state.get("min_size_mb")
+        if isinstance(min_size_mb, (int, float)):
+            normalized["min_size_mb"] = max(0.0, float(min_size_mb))
+
+        max_size_mb = filter_state.get("max_size_mb")
+        if isinstance(max_size_mb, (int, float)):
+            normalized["max_size_mb"] = max(0.0, float(max_size_mb))
+
+        min_change_pct = filter_state.get("min_change_pct")
+        if isinstance(min_change_pct, (int, float)):
+            normalized["min_change_pct"] = float(min_change_pct)
+
+        max_change_pct = filter_state.get("max_change_pct")
+        if isinstance(max_change_pct, (int, float)):
+            normalized["max_change_pct"] = float(max_change_pct)
+
+        return normalized
+
+    def _show_filter_dialog(self):
+        if self._filter_dialog is None:
+            dialog = _FilterDialog(self)
+            dialog.name_path_edit.textChanged.connect(self._on_filter_ui_changed)
+            dialog.codec_edit.textChanged.connect(self._on_filter_ui_changed)
+            dialog.recommend_combo.currentIndexChanged.connect(self._on_filter_ui_changed)
+            dialog.min_size_mb_edit.textChanged.connect(self._on_filter_ui_changed)
+            dialog.max_size_mb_edit.textChanged.connect(self._on_filter_ui_changed)
+            dialog.min_change_pct_edit.textChanged.connect(self._on_filter_ui_changed)
+            dialog.max_change_pct_edit.textChanged.connect(self._on_filter_ui_changed)
+            dialog._reset_button.clicked.connect(self._on_filter_reset_clicked)
+            self._filter_dialog = dialog
+
+        self._filter_dialog.show()
+        self._filter_dialog.raise_()
+        self._filter_dialog.activateWindow()
+
+    def _on_filter_reset_clicked(self):
+        if self._filter_dialog is None:
+            return
+        self._filter_dialog.clear_fields()
+        self._on_filter_ui_changed()
+
+    def _on_filter_ui_changed(self):
+        if self._filter_dialog is None:
+            return
+        self._set_filter_state(self._filter_dialog.as_filter_state())
+
+    def _set_filter_state(self, filter_state: dict):
+        normalized = self._normalize_filter_state(filter_state)
+        if normalized == self._filter_state:
+            return
+
+        self._filter_state = normalized
+        self._pagination_page = 0
+
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            self._virtual_model.set_filter_state(self._filter_state)
+
+        self._pagination_last_state = None
+        self._apply_pagination(save_settings=False)
+        self._update_label()
+
+    def _rebuild_filtered_widget_rows(self):
+        if self._use_virtual_table:
+            return
+
+        row_count = self._table.rowCount()
+        if not self._filter_state:
+            self._filtered_widget_rows = list(range(row_count))
+            return
+
+        matched_rows: list[int] = []
+        for row in range(row_count):
+            if self._widget_row_matches_filter(row):
+                matched_rows.append(row)
+        self._filtered_widget_rows = matched_rows
+
+    def _widget_row_matches_filter(self, row: int) -> bool:
+        name_col = VCOL_NAME if self._supports_conversion else COL_NAME
+        codec_col = VCOL_CODEC if self._supports_conversion else COL_CODEC
+        rec_col = VCOL_REC if self._supports_conversion else COL_REC
+        size_col = VCOL_SIZE if self._supports_conversion else COL_SIZE
+        path_col = self._path_column()
+        estimate_col = VCOL_ESTIMATE if self._supports_conversion else COL_ESTIMATE
+
+        name_item = self._table.item(row, name_col)
+        path_item = self._table.item(row, path_col)
+        codec_item = self._table.item(row, codec_col)
+        rec_item = self._table.item(row, rec_col)
+        size_item = self._table.item(row, size_col)
+        estimate_item = self._table.item(row, estimate_col)
+
+        name_text = name_item.text() if name_item is not None else ""
+        path_text = path_item.text() if path_item is not None else ""
+        codec_text = codec_item.text() if codec_item is not None else ""
+        rec_status = str(rec_item.data(Qt.ItemDataRole.UserRole) or "").strip().lower() if rec_item is not None else ""
+        size_bytes = int(size_item.data(Qt.ItemDataRole.UserRole) or 0) if size_item is not None else 0
+        estimate_sort = float(estimate_item.data(Qt.ItemDataRole.UserRole) or -1) if estimate_item is not None else -1
+
+        name_path_filter = self._filter_state.get("name_path")
+        if name_path_filter:
+            haystack = f"{name_text} {path_text}".casefold()
+            if name_path_filter not in haystack:
+                return False
+
+        codec_filter = self._filter_state.get("codec")
+        if codec_filter and codec_filter not in codec_text.casefold():
+            return False
+
+        recommendation_filter = self._filter_state.get("recommendation")
+        if recommendation_filter == "reencode" and rec_status != "reencode":
+            return False
+        if recommendation_filter == "keep" and rec_status not in {"good", "optimal"}:
+            return False
+
+        min_size_mb = self._filter_state.get("min_size_mb")
+        if min_size_mb is not None and size_bytes < int(float(min_size_mb) * 1024 * 1024):
+            return False
+
+        max_size_mb = self._filter_state.get("max_size_mb")
+        if max_size_mb is not None and size_bytes > int(float(max_size_mb) * 1024 * 1024):
+            return False
+
+        min_change_pct = self._filter_state.get("min_change_pct")
+        max_change_pct = self._filter_state.get("max_change_pct")
+        if min_change_pct is not None or max_change_pct is not None:
+            change_pct = _estimate_change_pct(size_bytes, estimate_sort)
+            if change_pct is None:
+                return False
+            if min_change_pct is not None and change_pct < float(min_change_pct):
+                return False
+            if max_change_pct is not None and change_pct > float(max_change_pct):
+                return False
+
+        return True
+
     def _rebuild_path_rows(self):
         if self._use_virtual_table:
             return
@@ -903,6 +1161,7 @@ class MediaPanel(QWidget):
 
             rec_item = QTableWidgetItem(rec_label)
             rec_item.setToolTip(reason)
+            rec_item.setData(Qt.ItemDataRole.UserRole, status)
             color = {
                 "optimal": _COLOR_OPTIMAL,
                 "good": _COLOR_GOOD,
@@ -941,6 +1200,7 @@ class MediaPanel(QWidget):
 
         rec_item = QTableWidgetItem(rec_label)
         rec_item.setToolTip(reason)
+        rec_item.setData(Qt.ItemDataRole.UserRole, status)
         color = {
             "optimal": _COLOR_OPTIMAL,
             "good": _COLOR_GOOD,
@@ -957,6 +1217,7 @@ class MediaPanel(QWidget):
     def _audio_estimate_item(self, path: str, size_bytes: int, probe_info: dict | None):
         estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, probe_info)
         estimate_item = _NumericItem(estimate_text, estimate_sort)
+        estimate_item.setData(Qt.ItemDataRole.UserRole, estimate_sort)
         if estimate_text == "Pending probe":
             estimate_item.setToolTip("Estimate appears after probe completes.")
         elif estimate_sort >= 0:
@@ -1010,6 +1271,7 @@ class MediaPanel(QWidget):
         codec_item = QTableWidgetItem(codec_text)
         rec_item = QTableWidgetItem(rec_label)
         rec_item.setToolTip(reason)
+        rec_item.setData(Qt.ItemDataRole.UserRole, status)
 
         color = {
             "optimal": _COLOR_OPTIMAL,
@@ -1089,16 +1351,19 @@ class MediaPanel(QWidget):
             probe_info,
             recommended_label=rec_label,
         )
+        estimate_change_pct = _estimate_change_pct(int(size_bytes), float(estimate_sort)) if estimate_sort >= 0 else None
         return {
             "name": os.path.basename(path),
             "size_bytes": int(size_bytes),
             "size_text": _human_size(size_bytes),
             "codec": codec_text,
             "recommend": rec_label,
+            "rec_status": status,
             "rec_reason": reason,
             "rec_color": recommendation_color(status),
             "estimate_text": estimate_text,
             "estimate_sort": estimate_sort,
+            "estimate_change_pct": estimate_change_pct,
             "estimate_tip": estimate_tip,
             "path": path,
             "modified": self._format_modified(modified_timestamp),
@@ -1336,12 +1601,14 @@ class MediaPanel(QWidget):
                     estimate_tip = None
                 else:
                     estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, None)
+                estimate_change_pct = _estimate_change_pct(size_bytes, float(estimate_sort)) if estimate_sort >= 0 else None
                 row_updates[path] = {
                     "size_bytes": int(size_bytes),
                     "size_text": _human_size(size_bytes),
                     "modified": self._format_modified(modified_timestamp),
                     "estimate_text": estimate_text,
                     "estimate_sort": estimate_sort,
+                    "estimate_change_pct": estimate_change_pct,
                     "estimate_tip": estimate_tip,
                 }
 
@@ -1380,6 +1647,7 @@ class MediaPanel(QWidget):
                         estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
                         estimate_item = _NumericItem(estimate_text, estimate_bytes)
                         estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        estimate_item.setData(Qt.ItemDataRole.UserRole, estimate_bytes)
                         estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     else:
                         estimate_item = self._audio_estimate_item(path, size_bytes, None)
@@ -1392,6 +1660,7 @@ class MediaPanel(QWidget):
                         estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
                         estimate_item = _NumericItem(estimate_text, estimate_bytes)
                         estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        estimate_item.setData(Qt.ItemDataRole.UserRole, estimate_bytes)
                         estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     else:
                         estimate_item = self._audio_estimate_item(path, size_bytes, None)
@@ -1451,13 +1720,16 @@ class MediaPanel(QWidget):
                     probe_info,
                     recommended_label=rec_label,
                 )
+                estimate_change_pct = _estimate_change_pct(size_bytes, float(estimate_sort)) if estimate_sort >= 0 else None
                 row_updates[path] = {
                     "codec": codec_text,
                     "recommend": rec_label,
+                    "rec_status": status,
                     "rec_reason": reason,
                     "rec_color": recommendation_color(status),
                     "estimate_text": estimate_text,
                     "estimate_sort": estimate_sort,
+                    "estimate_change_pct": estimate_change_pct,
                     "estimate_tip": estimate_tip,
                 }
 
@@ -1541,10 +1813,7 @@ class MediaPanel(QWidget):
             self._refresh_selection_controls()
 
     def file_count(self) -> int:
-        if self._use_virtual_table:
-            assert self._virtual_model is not None
-            return self._virtual_model.total_row_count()
-        return self._table.rowCount()
+        return self._visible_file_count()
 
     def set_scan_locked(self, locked: bool):
         self._scan_locked = locked
@@ -1623,16 +1892,22 @@ class MediaPanel(QWidget):
         return visible + hidden
 
     def _update_label(self):
-        count = self.file_count()
-        if count == 0:
-            self._label.setText("No files found yet.")
+        visible_count = self.file_count()
+        total_count = self.total_file_count()
+        if visible_count == 0:
+            if total_count == 0:
+                self._label.setText("No files found yet.")
+            else:
+                noun = "file" if total_count == 1 else "files"
+                self._label.setText(f"0/{total_count} {noun}")
         else:
-            noun = "file" if count == 1 else "files"
+            noun = "file" if visible_count == 1 else "files"
+            count_text = f"{visible_count} {noun}" if visible_count == total_count else f"{visible_count}/{total_count} {noun}"
             if self._supports_conversion:
                 selected = self._selected_row_count()
-                self._label.setText(f"{count} {noun} ({selected} selected)")
+                self._label.setText(f"{count_text} ({selected} selected)")
             else:
-                self._label.setText(f"{count} {noun}")
+                self._label.setText(count_text)
 
 
 class FailedPanel(QWidget):

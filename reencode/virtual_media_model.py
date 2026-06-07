@@ -19,11 +19,14 @@ class VirtualMediaTableModel(QAbstractTableModel):
         self._pagination_page_size = 50
         self._path_rows: dict[str, int] = {}
         self._path_rows_dirty = False
+        self._filter_state: dict[str, Any] = {}
+        self._filtered_rows: list[int] = []
+        self._filtered_positions: dict[int, int] = {}
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
             return 0
-        total_rows = len(self._rows)
+        total_rows = len(self._filtered_rows)
         if total_rows <= 0:
             return 0
 
@@ -107,6 +110,7 @@ class VirtualMediaTableModel(QAbstractTableModel):
         reverse = order == Qt.SortOrder.DescendingOrder
         self.layoutAboutToBeChanged.emit()
         self._rows.sort(key=lambda row: self._sort_key(row, column), reverse=reverse)
+        self._rebuild_filtered_rows()
         self.layoutChanged.emit()
         self._path_rows_dirty = True
 
@@ -117,32 +121,39 @@ class VirtualMediaTableModel(QAbstractTableModel):
         self._pagination_page = 0
         self._path_rows.clear()
         self._path_rows_dirty = False
+        self._filtered_rows.clear()
+        self._filtered_positions.clear()
         self.endResetModel()
 
     def append_rows(self, rows: list[dict[str, Any]]):
         if not rows:
             return
-
-        total_before = len(self._rows)
-        exposed_before = self._exposed_count
-        total_after = total_before + len(rows)
-
-        target_exposed = exposed_before
-        if exposed_before == total_before and exposed_before < self._exposure_chunk:
-            target_exposed = min(total_after, self._exposure_chunk)
-
-        if target_exposed > exposed_before:
-            self.beginInsertRows(QModelIndex(), exposed_before, target_exposed - 1)
-            self._rows.extend(rows)
-            self._exposed_count = target_exposed
-            self.endInsertRows()
-        else:
-            self._rows.extend(rows)
-
+        self.beginResetModel()
+        self._rows.extend(rows)
+        self._exposed_count = len(self._rows)
+        self._rebuild_filtered_rows()
         self._path_rows_dirty = True
+        self.endResetModel()
 
     def total_row_count(self) -> int:
         return len(self._rows)
+
+    def filtered_row_count(self) -> int:
+        return len(self._filtered_rows)
+
+    def set_filter_state(self, filter_state: dict[str, Any]):
+        normalized = self._normalize_filter_state(filter_state)
+        if normalized == self._filter_state:
+            return
+
+        self.beginResetModel()
+        self._filter_state = normalized
+        self._pagination_page = 0
+        self._rebuild_filtered_rows()
+        self.endResetModel()
+
+    def has_active_filter(self) -> bool:
+        return bool(self._filter_state)
 
     def canFetchMore(self, parent: QModelIndex = QModelIndex()) -> bool:
         if parent.isValid():
@@ -186,7 +197,6 @@ class VirtualMediaTableModel(QAbstractTableModel):
         if self._path_rows_dirty:
             self._rebuild_path_rows()
 
-        changed_visible_rows: list[int] = []
         updated_count = 0
         for path, updates in row_updates.items():
             row = self._path_rows.get(path)
@@ -195,11 +205,10 @@ class VirtualMediaTableModel(QAbstractTableModel):
 
             self._rows[row].update(updates)
             updated_count += 1
-            visible_row = self._display_row_from_full_row(row)
-            if visible_row is not None:
-                changed_visible_rows.append(visible_row)
-
-        self._emit_coalesced_data_changed(changed_visible_rows)
+        if updated_count > 0:
+            self.beginResetModel()
+            self._rebuild_filtered_rows()
+            self.endResetModel()
         return updated_count
 
     def _emit_coalesced_data_changed(self, rows: list[int]):
@@ -235,17 +244,113 @@ class VirtualMediaTableModel(QAbstractTableModel):
         return self._pagination_page * self._pagination_page_size
 
     def _display_row_from_full_row(self, full_row: int) -> int | None:
+        filtered_row = self._filtered_positions.get(full_row)
+        if filtered_row is None:
+            return None
         start = self._current_page_start()
         end = start + self._pagination_page_size
-        if full_row < start or full_row >= end:
+        if filtered_row < start or filtered_row >= end:
             return None
-        return full_row - start
+        return filtered_row - start
 
     def _full_row_from_display_row(self, display_row: int) -> int | None:
-        full_row = self._current_page_start() + display_row
-        if full_row < 0 or full_row >= len(self._rows):
+        filtered_row = self._current_page_start() + display_row
+        if filtered_row < 0 or filtered_row >= len(self._filtered_rows):
             return None
-        return full_row
+        return self._filtered_rows[filtered_row]
+
+    def _rebuild_filtered_rows(self):
+        self._filtered_rows = [
+            row_index
+            for row_index, row_data in enumerate(self._rows)
+            if self._row_matches_filter(row_data)
+        ]
+        self._filtered_positions = {full_row: idx for idx, full_row in enumerate(self._filtered_rows)}
+
+    def _normalize_filter_state(self, filter_state: dict[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+
+        name_path = str(filter_state.get("name_path") or "").strip().casefold()
+        if name_path:
+            normalized["name_path"] = name_path
+
+        codec = str(filter_state.get("codec") or "").strip().casefold()
+        if codec:
+            normalized["codec"] = codec
+
+        recommendation = str(filter_state.get("recommendation") or "").strip().lower()
+        if recommendation in {"reencode", "keep"}:
+            normalized["recommendation"] = recommendation
+
+        min_size_mb = self._as_float(filter_state.get("min_size_mb"))
+        if min_size_mb is not None:
+            normalized["min_size_mb"] = max(0.0, min_size_mb)
+
+        max_size_mb = self._as_float(filter_state.get("max_size_mb"))
+        if max_size_mb is not None:
+            normalized["max_size_mb"] = max(0.0, max_size_mb)
+
+        min_change_pct = self._as_float(filter_state.get("min_change_pct"))
+        if min_change_pct is not None:
+            normalized["min_change_pct"] = min_change_pct
+
+        max_change_pct = self._as_float(filter_state.get("max_change_pct"))
+        if max_change_pct is not None:
+            normalized["max_change_pct"] = max_change_pct
+
+        return normalized
+
+    def _as_float(self, value: Any) -> float | None:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _row_matches_filter(self, row_data: dict[str, Any]) -> bool:
+        if not self._filter_state:
+            return True
+
+        name_path_filter = self._filter_state.get("name_path")
+        if name_path_filter:
+            haystack = f"{row_data.get('name', '')} {row_data.get('path', '')}".casefold()
+            if name_path_filter not in haystack:
+                return False
+
+        codec_filter = self._filter_state.get("codec")
+        if codec_filter and codec_filter not in str(row_data.get("codec") or "").casefold():
+            return False
+
+        recommendation_filter = self._filter_state.get("recommendation")
+        if recommendation_filter:
+            status = str(row_data.get("rec_status") or "").strip().lower()
+            if recommendation_filter == "reencode" and status != "reencode":
+                return False
+            if recommendation_filter == "keep" and status not in {"good", "optimal"}:
+                return False
+
+        size_bytes = int(row_data.get("size_bytes") or 0)
+        min_size_mb = self._filter_state.get("min_size_mb")
+        if min_size_mb is not None and size_bytes < int(min_size_mb * 1024 * 1024):
+            return False
+        max_size_mb = self._filter_state.get("max_size_mb")
+        if max_size_mb is not None and size_bytes > int(max_size_mb * 1024 * 1024):
+            return False
+
+        min_change_pct = self._filter_state.get("min_change_pct")
+        max_change_pct = self._filter_state.get("max_change_pct")
+        if min_change_pct is not None or max_change_pct is not None:
+            change_pct = row_data.get("estimate_change_pct")
+            if change_pct is None:
+                return False
+            change_pct_value = float(change_pct)
+            if min_change_pct is not None and change_pct_value < float(min_change_pct):
+                return False
+            if max_change_pct is not None and change_pct_value > float(max_change_pct):
+                return False
+
+        return True
 
     def _sort_key(self, row_data: dict[str, Any], column: int):
         if column == 1:

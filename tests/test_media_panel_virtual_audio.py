@@ -112,6 +112,40 @@ class MediaPanelVirtualAudioTests(unittest.TestCase):
         second_page_name = model.data(model.index(0, 0), Qt.ItemDataRole.DisplayRole)
         self.assertEqual(second_page_name, "song-050.mp3")
 
+    def test_virtual_audio_filter_dialog_updates_visible_count_live(self):
+        rows = [(f"C:/tmp/song-{idx:03d}.mp3", 1000 + idx, "1") for idx in range(80)]
+        self.panel.add_files(rows)
+
+        self.panel._show_filter_dialog()
+        assert self.panel._filter_dialog is not None
+        self.panel._filter_dialog.name_path_edit.setText("song-050")
+
+        self.assertEqual(self.panel.file_count(), 1)
+        self.assertEqual(self.panel._page_label.text(), "Page 1 of 1")
+        self.assertEqual(self.panel._label.text(), "1/80 file")
+
+        self.panel._filter_dialog.name_path_edit.clear()
+        self.assertEqual(self.panel.file_count(), 80)
+        self.assertEqual(self.panel._page_label.text(), "Page 1 of 2")
+
+    def test_virtual_audio_filter_dialog_size_range(self):
+        rows = [
+            ("C:/tmp/small.mp3", 500 * 1024, "1"),
+            ("C:/tmp/medium.mp3", 2 * 1024 * 1024, "1"),
+            ("C:/tmp/large.mp3", 5 * 1024 * 1024, "1"),
+        ]
+        self.panel.add_files(rows)
+
+        self.panel._show_filter_dialog()
+        assert self.panel._filter_dialog is not None
+        self.panel._filter_dialog.min_size_mb_edit.setText("1")
+        self.panel._filter_dialog.max_size_mb_edit.setText("3")
+
+        self.assertEqual(self.panel.file_count(), 1)
+        model = self.panel._virtual_model
+        assert model is not None
+        self.assertEqual(model.data(model.index(0, 0), Qt.ItemDataRole.DisplayRole), "medium.mp3")
+
 
 if __name__ == "__main__":
     unittest.main()
