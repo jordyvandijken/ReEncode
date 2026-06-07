@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication, QAbstractItemView
 
-from reencode.media_panel import FailedPanel, MediaPanel, VCOL_CODEC, VCOL_REC, VCOL_SELECT
+from reencode.media_panel import FailedPanel, MediaPanel, VCOL_CODEC, VCOL_ESTIMATE, VCOL_REC, VCOL_SELECT
 
 
 class MediaPanelPathIndexTests(unittest.TestCase):
@@ -264,15 +264,23 @@ class MediaPanelConversionParityTests(unittest.TestCase):
 
             panel.set_active_preset("compatibility")
             rec_item = panel._table.item(0, VCOL_REC)
+            estimate_compat = panel._table.item(0, VCOL_ESTIMATE)
             self.assertIsNotNone(rec_item)
+            self.assertIsNotNone(estimate_compat)
             assert rec_item is not None
+            assert estimate_compat is not None
             self.assertEqual(rec_item.text(), "H.264")
+            estimate_compat_text = estimate_compat.text()
 
             panel.set_active_preset("archive")
             rec_item = panel._table.item(0, VCOL_REC)
+            estimate_archive = panel._table.item(0, VCOL_ESTIMATE)
             self.assertIsNotNone(rec_item)
+            self.assertIsNotNone(estimate_archive)
             assert rec_item is not None
+            assert estimate_archive is not None
             self.assertEqual(rec_item.text(), "AV1")
+            self.assertNotEqual(estimate_compat_text, estimate_archive.text())
         finally:
             panel.close()
 

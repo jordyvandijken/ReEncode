@@ -191,6 +191,13 @@ def _normalize_codec_name(value: str | None) -> str:
     return label
 
 
+def _image_extension_for_recommendation(recommended_label: str, source_path: str) -> str:
+    codec_name = _normalize_codec_name(recommended_label)
+    if codec_name == "original":
+        return Path(source_path).suffix.lower() or ".webp"
+    return _IMAGE_CODEC_TO_EXTENSION.get(codec_name, ".webp")
+
+
 def _columns_for_media_type(media_type: str, supports_conversion: bool) -> list[str]:
     if media_type == "Images":
         return IMAGE_SELECTABLE_COLUMNS if supports_conversion else IMAGE_BASE_COLUMNS
@@ -507,11 +514,21 @@ class MediaPanel(QWidget):
                     continue
                 probe_info = self._probe_by_path.get(path)
                 codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
+                size_bytes = int(row_data.get("size_bytes") or 0)
+                estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(
+                    path,
+                    size_bytes,
+                    probe_info,
+                    recommended_label=rec_label,
+                )
                 row_updates[path] = {
                     "codec": codec_text,
                     "recommend": rec_label,
                     "rec_reason": reason,
                     "rec_color": recommendation_color(status),
+                    "estimate_text": estimate_text,
+                    "estimate_sort": estimate_sort,
+                    "estimate_tip": estimate_tip,
                 }
             self._virtual_model.update_rows(row_updates)
             return
@@ -903,7 +920,7 @@ class MediaPanel(QWidget):
             size_bytes,
             self._media_type,
             path,
-            probe_info,
+            self._probe_info_for_estimate(path, probe_info, rec_label),
         )
         if estimate.estimated_size is None:
             estimate_item = _NumericItem("—", -1)
@@ -952,15 +969,29 @@ class MediaPanel(QWidget):
         estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         return estimate_item
 
-    def _audio_estimate_values(self, path: str, size_bytes: int, probe_info: dict | None) -> tuple[str, float, str | None]:
+    def _audio_estimate_values(
+        self,
+        path: str,
+        size_bytes: int,
+        probe_info: dict | None,
+        recommended_label: str | None = None,
+    ) -> tuple[str, float, str | None]:
         if self._media_type.lower() == "audio" and probe_info is None:
             return "Pending probe", -1, "Estimate appears after probe completes."
+
+        if recommended_label is None:
+            _codec_text, recommended_label, _reason, _status = self._base_codec_recommend_values(path, probe_info)
+
+        estimate_path = path
+        if self._media_type == "Images":
+            target_ext = _image_extension_for_recommendation(recommended_label, path)
+            estimate_path = str(Path(path).with_suffix(target_ext))
 
         estimate = size_estimator.estimate_output_details(
             size_bytes,
             self._media_type,
-            path,
-            probe_info,
+            estimate_path,
+            self._probe_info_for_estimate(path, probe_info, recommended_label),
         )
         if estimate.estimated_size is None:
             return "—", -1, estimate.reason
@@ -1052,7 +1083,12 @@ class MediaPanel(QWidget):
 
     def _virtual_row(self, path: str, size_bytes: int, modified_timestamp: str, probe_info: dict | None) -> dict:
         codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
-        estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, probe_info)
+        estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(
+            path,
+            size_bytes,
+            probe_info,
+            recommended_label=rec_label,
+        )
         return {
             "name": os.path.basename(path),
             "size_bytes": int(size_bytes),
@@ -1067,6 +1103,27 @@ class MediaPanel(QWidget):
             "path": path,
             "modified": self._format_modified(modified_timestamp),
         }
+
+    def _probe_info_for_estimate(
+        self,
+        path: str,
+        probe_info: dict | None,
+        recommended_label: str,
+    ) -> dict | None:
+        if self._media_type not in {"Videos", "Audio"}:
+            return probe_info
+
+        info = dict(probe_info or {})
+        target_codec = _normalize_codec_name(recommended_label)
+        if target_codec == "original" or not target_codec:
+            return info if info else probe_info
+
+        if self._media_type == "Videos":
+            info["video_codec"] = target_codec
+        else:
+            info["audio_codec"] = target_codec
+
+        return info
 
     def _convert_selected(self):
         if self._conversion_thread is not None:
@@ -1388,7 +1445,12 @@ class MediaPanel(QWidget):
                 if size_bytes is None:
                     continue
                 codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
-                estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, probe_info)
+                estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(
+                    path,
+                    size_bytes,
+                    probe_info,
+                    recommended_label=rec_label,
+                )
                 row_updates[path] = {
                     "codec": codec_text,
                     "recommend": rec_label,
