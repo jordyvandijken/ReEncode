@@ -259,8 +259,8 @@ class MediaPanelConversionParityTests(unittest.TestCase):
         panel = MediaPanel("Videos")
         try:
             path = "C:/tmp/video.mp4"
-            panel.add_file(path, 2048, "1")
-            panel.update_probes([(path, {"video_codec": "h264", "duration": 10.0})])
+            panel.add_file(path, 2_000_000, "1")
+            panel.update_probes([(path, {"video_codec": "h264", "duration": 10.0, "video_bitrate": 800_000})])
 
             panel.set_active_preset("compatibility")
             rec_item = panel._table.item(0, VCOL_REC)
@@ -271,6 +271,20 @@ class MediaPanelConversionParityTests(unittest.TestCase):
             assert estimate_compat is not None
             self.assertEqual(rec_item.text(), "H.264")
             estimate_compat_text = estimate_compat.text()
+            self.assertIn("927.7 KB", estimate_compat_text)
+            self.assertIn("-52%", estimate_compat_text)
+
+            panel.set_active_preset("streaming")
+            rec_item = panel._table.item(0, VCOL_REC)
+            estimate_streaming = panel._table.item(0, VCOL_ESTIMATE)
+            self.assertIsNotNone(rec_item)
+            self.assertIsNotNone(estimate_streaming)
+            assert rec_item is not None
+            assert estimate_streaming is not None
+            self.assertEqual(rec_item.text(), "HEVC (H.265)")
+            estimate_streaming_text = estimate_streaming.text()
+            self.assertIn("722.7 KB", estimate_streaming_text)
+            self.assertIn("-63%", estimate_streaming_text)
 
             panel.set_active_preset("archive")
             rec_item = panel._table.item(0, VCOL_REC)
@@ -280,6 +294,8 @@ class MediaPanelConversionParityTests(unittest.TestCase):
             assert rec_item is not None
             assert estimate_archive is not None
             self.assertEqual(rec_item.text(), "AV1")
+            self.assertIn("605.5 KB", estimate_archive.text())
+            self.assertIn("-69%", estimate_archive.text())
             self.assertNotEqual(estimate_compat_text, estimate_archive.text())
         finally:
             panel.close()

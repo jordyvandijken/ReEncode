@@ -19,8 +19,43 @@ class SizeEstimatorTests(unittest.TestCase):
         )
 
         self.assertEqual(details.mode, "bitrate")
-        self.assertEqual(details.estimated_size, 580_000)
-        self.assertAlmostEqual(details.savings_ratio or 0.0, 0.71, places=2)
+        self.assertEqual(details.estimated_size, 950_000)
+        self.assertAlmostEqual(details.savings_ratio or 0.0, 0.525, places=2)
+
+    def test_video_target_codec_ordering_prefers_av1_over_hevc_over_h264(self):
+        size_bytes = 2_000_000
+        base_probe = {
+            "duration": 10.0,
+            "video_bitrate": 800_000,
+        }
+
+        av1 = size_estimator.estimate_output_details(
+            size_bytes=size_bytes,
+            media_type="Videos",
+            path="C:/tmp/video.mp4",
+            probe_info={**base_probe, "video_codec": "av1"},
+        )
+        hevc = size_estimator.estimate_output_details(
+            size_bytes=size_bytes,
+            media_type="Videos",
+            path="C:/tmp/video.mp4",
+            probe_info={**base_probe, "video_codec": "hevc"},
+        )
+        h264 = size_estimator.estimate_output_details(
+            size_bytes=size_bytes,
+            media_type="Videos",
+            path="C:/tmp/video.mp4",
+            probe_info={**base_probe, "video_codec": "h264"},
+        )
+
+        self.assertIsNotNone(av1.estimated_size)
+        self.assertIsNotNone(hevc.estimated_size)
+        self.assertIsNotNone(h264.estimated_size)
+        assert av1.estimated_size is not None
+        assert hevc.estimated_size is not None
+        assert h264.estimated_size is not None
+        self.assertLess(av1.estimated_size, hevc.estimated_size)
+        self.assertLess(hevc.estimated_size, h264.estimated_size)
 
     def test_unknown_audio_codec_uses_low_confidence_fallback(self):
         details = size_estimator.estimate_output_details(
