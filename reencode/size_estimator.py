@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 
 
@@ -55,6 +56,21 @@ _IMAGE_FACTORS = {
     ".ico": 0.85,
 }
 
+_VIDEO_UNKNOWN_FACTOR = 0.60
+_AUDIO_UNKNOWN_FACTOR = 0.75
+_IMAGE_UNKNOWN_FACTOR = 0.80
+
+
+@dataclass(frozen=True)
+class EstimateDetails:
+    estimated_size: int | None
+    savings_ratio: float | None
+    mode: str
+    confidence: str
+    fallback_used: bool
+    clamped: bool
+    reason: str | None
+
 
 def _clamp_factor(value: float) -> float:
     if value < 0.05:
@@ -64,40 +80,134 @@ def _clamp_factor(value: float) -> float:
     return value
 
 
+def _estimate_from_bitrate(duration_seconds: float, bitrate_bps: int, factor: float) -> int:
+    source_size = (bitrate_bps / 8.0) * duration_seconds
+    return max(1, int(source_size * factor))
+
+
+def _image_tier_adjustment(size_bytes: int) -> float:
+    # Small images often have less redundant data; very large images usually have more room to shrink.
+    if size_bytes <= 512 * 1024:
+        return 1.05
+    if size_bytes >= 5 * 1024 * 1024:
+        return 0.92
+    return 1.00
+
+
+def _safe_positive_float(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _safe_positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def estimate_output_details(size_bytes: int, media_type: str, path: str, probe_info: dict | None) -> EstimateDetails:
+    """Return estimate details including confidence and fallback metadata."""
+    if size_bytes <= 0:
+        return EstimateDetails(None, None, "unavailable", "none", False, False, "Invalid source size.")
+
+    factor: float | None = None
+    fallback_used = False
+    media_key = media_type.lower()
+    clamped = False
+
+    if media_key == "videos":
+        codec = ((probe_info or {}).get("video_codec") or "").lower()
+        factor = _VIDEO_FACTORS.get(codec)
+        if factor is None:
+            factor = _VIDEO_UNKNOWN_FACTOR
+            fallback_used = True
+    elif media_key == "audio":
+        codec = ((probe_info or {}).get("audio_codec") or "").lower()
+        factor = _AUDIO_FACTORS.get(codec)
+        if factor is None:
+            factor = _AUDIO_UNKNOWN_FACTOR
+            fallback_used = True
+    elif media_key == "images":
+        ext = os.path.splitext(path)[1].lower()
+        factor = _IMAGE_FACTORS.get(ext)
+        if factor is None:
+            factor = _IMAGE_UNKNOWN_FACTOR
+            fallback_used = True
+        factor *= _image_tier_adjustment(size_bytes)
+    else:
+        return EstimateDetails(None, None, "unavailable", "none", False, False, "Unsupported media type.")
+
+    clamped_factor = _clamp_factor(factor)
+    if clamped_factor != factor:
+        clamped = True
+    factor = clamped_factor
+
+    estimate_mode = "factor"
+    reason = "Codec or extension factor estimate."
+    est_size = max(1, int(size_bytes * factor))
+
+    if media_key in {"videos", "audio"}:
+        duration = _safe_positive_float((probe_info or {}).get("duration"))
+        if media_key == "videos":
+            bitrate = _safe_positive_int((probe_info or {}).get("video_bitrate"))
+            if bitrate is None:
+                bitrate = _safe_positive_int((probe_info or {}).get("format_bitrate"))
+        else:
+            bitrate = _safe_positive_int((probe_info or {}).get("audio_bitrate"))
+            if bitrate is None:
+                bitrate = _safe_positive_int((probe_info or {}).get("format_bitrate"))
+
+        if duration is not None and bitrate is not None:
+            est_size = _estimate_from_bitrate(duration, bitrate, factor)
+            estimate_mode = "bitrate"
+            reason = "Bitrate-duration estimate adjusted by codec factor."
+        elif fallback_used:
+            reason = "Fallback factor estimate due to unknown codec and missing bitrate context."
+
+    savings = 1.0 - (est_size / size_bytes)
+    bounded_savings = max(0.0, min(0.99, savings))
+    if bounded_savings != savings:
+        clamped = True
+
+    if fallback_used:
+        confidence = "low"
+    elif estimate_mode == "bitrate":
+        confidence = "medium"
+    else:
+        confidence = "medium"
+
+    return EstimateDetails(
+        estimated_size=est_size,
+        savings_ratio=bounded_savings,
+        mode=estimate_mode,
+        confidence=confidence,
+        fallback_used=fallback_used,
+        clamped=clamped,
+        reason=reason,
+    )
+
+
 def estimate_output(size_bytes: int, media_type: str, path: str, probe_info: dict | None) -> tuple[int | None, float | None]:
     """Return estimated output size bytes and savings ratio (0-1).
 
     savings ratio is the fractional reduction: 0.45 means 45% smaller.
     """
-    if size_bytes <= 0:
-        return None, None
-
-    factor = None
-    media_key = media_type.lower()
-
-    if media_key == "videos":
-        codec = ((probe_info or {}).get("video_codec") or "").lower()
-        factor = _VIDEO_FACTORS.get(codec, 0.60)
-    elif media_key == "audio":
-        codec = ((probe_info or {}).get("audio_codec") or "").lower()
-        factor = _AUDIO_FACTORS.get(codec, 0.75)
-    elif media_key == "images":
-        ext = os.path.splitext(path)[1].lower()
-        factor = _IMAGE_FACTORS.get(ext, 0.80)
-
-    if factor is None:
-        return None, None
-
-    factor = _clamp_factor(factor)
-    est_size = max(1, int(size_bytes * factor))
-    savings = max(0.0, min(0.99, 1.0 - (est_size / size_bytes)))
-    return est_size, savings
+    details = estimate_output_details(size_bytes, media_type, path, probe_info)
+    return details.estimated_size, details.savings_ratio
 
 
-def format_estimate(human_size_text: str, savings_ratio: float | None) -> str:
+def format_estimate(human_size_text: str, savings_ratio: float | None, low_confidence: bool = False) -> str:
     """Return display text for estimate cell."""
     if savings_ratio is None:
         return human_size_text
     change_pct = -savings_ratio * 100
     sign = "+" if change_pct >= 0 else ""
-    return f"{human_size_text} ({sign}{change_pct:.0f}%)"
+    display = f"{human_size_text} ({sign}{change_pct:.0f}%)"
+    if low_confidence:
+        return f"{display} ?"
+    return display

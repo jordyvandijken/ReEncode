@@ -66,6 +66,24 @@ class MediaPanelVirtualAudioTests(unittest.TestCase):
         estimate_text = model.data(model.index(0, 4), Qt.ItemDataRole.DisplayRole)
         self.assertEqual(estimate_text, "750 B (-25%)")
 
+    def test_virtual_audio_probe_fallback_marks_low_confidence(self):
+        self.panel.add_files([
+            ("C:/tmp/song.mp3", 1000, "1"),
+        ])
+
+        self.panel.update_probes([
+            ("C:/tmp/song.mp3", {"audio_codec": "unknown_codec"}),
+        ])
+
+        model = self.panel._virtual_model
+        assert model is not None
+
+        estimate_text = model.data(model.index(0, 4), Qt.ItemDataRole.DisplayRole)
+        estimate_tip = model.data(model.index(0, 4), Qt.ItemDataRole.ToolTipRole)
+
+        self.assertEqual(estimate_text, "750 B (-25%) ?")
+        self.assertEqual(estimate_tip, "Fallback factor estimate due to unknown codec and missing bitrate context.")
+
     def test_virtual_audio_file_count_tracks_total_rows(self):
         rows = [(f"C:/tmp/song-{idx}.mp3", 1000 + idx, "1") for idx in range(1500)]
         self.panel.add_files(rows)

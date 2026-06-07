@@ -78,6 +78,8 @@ class VirtualMediaTableModel(QAbstractTableModel):
                 return row_data["path"]
             if col == 3:
                 return row_data["rec_reason"]
+            if col == 4:
+                return row_data.get("estimate_tip")
             return None
 
         if role == Qt.ItemDataRole.TextAlignmentRole and col in {1, 4}:

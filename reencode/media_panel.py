@@ -753,18 +753,26 @@ class MediaPanel(QWidget):
 
             return codec_item, rec_item, estimate_item
 
-        estimate_bytes, savings_ratio = size_estimator.estimate_output(
+        estimate = size_estimator.estimate_output_details(
             size_bytes,
             self._media_type,
             path,
             probe_info,
         )
-        if estimate_bytes is None:
+        if estimate.estimated_size is None:
             estimate_item = _NumericItem("—", -1)
+            if estimate.reason:
+                estimate_item.setToolTip(estimate.reason)
         else:
-            estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
-            estimate_item = _NumericItem(estimate_text, estimate_bytes)
+            estimate_text = size_estimator.format_estimate(
+                _human_size(estimate.estimated_size),
+                estimate.savings_ratio,
+                low_confidence=estimate.confidence == "low",
+            )
+            estimate_item = _NumericItem(estimate_text, estimate.estimated_size)
             estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if estimate.reason and (estimate.fallback_used or estimate.clamped):
+                estimate_item.setToolTip(estimate.reason)
 
         codec_item = QTableWidgetItem(codec_text)
 
@@ -784,31 +792,40 @@ class MediaPanel(QWidget):
         return codec_item, rec_item, estimate_item
 
     def _audio_estimate_item(self, path: str, size_bytes: int, probe_info: dict | None):
-        estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
+        estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, probe_info)
         estimate_item = _NumericItem(estimate_text, estimate_sort)
         if estimate_text == "Pending probe":
             estimate_item.setToolTip("Estimate appears after probe completes.")
         elif estimate_sort >= 0:
             estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if estimate_tip:
+                estimate_item.setToolTip(estimate_tip)
+        elif estimate_tip:
+            estimate_item.setToolTip(estimate_tip)
 
         estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         return estimate_item
 
-    def _audio_estimate_values(self, path: str, size_bytes: int, probe_info: dict | None) -> tuple[str, float]:
+    def _audio_estimate_values(self, path: str, size_bytes: int, probe_info: dict | None) -> tuple[str, float, str | None]:
         if self._media_type.lower() == "audio" and probe_info is None:
-            return "Pending probe", -1
+            return "Pending probe", -1, "Estimate appears after probe completes."
 
-        estimate_bytes, savings_ratio = size_estimator.estimate_output(
+        estimate = size_estimator.estimate_output_details(
             size_bytes,
             self._media_type,
             path,
             probe_info,
         )
-        if estimate_bytes is None:
-            return "—", -1
+        if estimate.estimated_size is None:
+            return "—", -1, estimate.reason
         else:
-            estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
-            return estimate_text, estimate_bytes
+            estimate_text = size_estimator.format_estimate(
+                _human_size(estimate.estimated_size),
+                estimate.savings_ratio,
+                low_confidence=estimate.confidence == "low",
+            )
+            tip = estimate.reason if (estimate.fallback_used or estimate.clamped) else None
+            return estimate_text, estimate.estimated_size, tip
 
     def _base_codec_recommend_items(self, path: str, probe_info: dict | None):
         codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
@@ -860,7 +877,7 @@ class MediaPanel(QWidget):
 
     def _virtual_row(self, path: str, size_bytes: int, modified_timestamp: str, probe_info: dict | None) -> dict:
         codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
-        estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
+        estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, probe_info)
         return {
             "name": os.path.basename(path),
             "size_bytes": int(size_bytes),
@@ -871,6 +888,7 @@ class MediaPanel(QWidget):
             "rec_color": recommendation_color(status),
             "estimate_text": estimate_text,
             "estimate_sort": estimate_sort,
+            "estimate_tip": estimate_tip,
             "path": path,
             "modified": self._format_modified(modified_timestamp),
         }
@@ -1082,14 +1100,16 @@ class MediaPanel(QWidget):
                     savings_ratio = (1.0 - (estimate_bytes / size_bytes)) if size_bytes > 0 else None
                     estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
                     estimate_sort = estimate_bytes
+                    estimate_tip = None
                 else:
-                    estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, None)
+                    estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, None)
                 row_updates[path] = {
                     "size_bytes": int(size_bytes),
                     "size_text": _human_size(size_bytes),
                     "modified": self._format_modified(modified_timestamp),
                     "estimate_text": estimate_text,
                     "estimate_sort": estimate_sort,
+                    "estimate_tip": estimate_tip,
                 }
 
             self._virtual_model.update_rows(row_updates)
@@ -1189,7 +1209,7 @@ class MediaPanel(QWidget):
                 if size_bytes is None:
                     continue
                 codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
-                estimate_text, estimate_sort = self._audio_estimate_values(path, size_bytes, probe_info)
+                estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, probe_info)
                 row_updates[path] = {
                     "codec": codec_text,
                     "recommend": rec_label,
@@ -1197,6 +1217,7 @@ class MediaPanel(QWidget):
                     "rec_color": recommendation_color(status),
                     "estimate_text": estimate_text,
                     "estimate_sort": estimate_sort,
+                    "estimate_tip": estimate_tip,
                 }
 
             self._virtual_model.update_rows(row_updates)
