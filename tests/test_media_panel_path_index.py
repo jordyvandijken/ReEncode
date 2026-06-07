@@ -54,6 +54,7 @@ class MediaPanelPathIndexTests(unittest.TestCase):
             ("C:/tmp/a.mp4", 100, "1"),
             ("C:/tmp/b.mp4", 200, "2"),
         ])
+        self.panel._invalidate_path_rows()
 
         rebuild_calls = 0
         original = self.panel._rebuild_path_rows

@@ -67,7 +67,7 @@ python -m pip install -r requirements-build.txt
 python -m PyInstaller --noconfirm --clean ReEncode.spec
 ```
 
-Output is created as `dist\ReEncode.exe`.
+Output is created as `dist\ReEncode\ReEncode.exe`.
 
 ## Use
 

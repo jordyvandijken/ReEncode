@@ -95,6 +95,72 @@ class MainWindowScanContractTests(unittest.TestCase):
         self.assertEqual(record["media_type"], "Videos")
         self.assertEqual(record["last_scanned"], 1700000000)
 
+    def test_discovery_commits_once_after_finish(self):
+        class _DummyStore:
+            def __init__(self, db_path: Path):
+                self.db_path = db_path
+                self.upserts: list[tuple] = []
+                self.commit_calls = 0
+
+            def upsert_record(self, *args, **kwargs):
+                self.upserts.append((args, kwargs))
+
+            def commit(self):
+                self.commit_calls += 1
+
+            def close(self):
+                return None
+
+        class _DummySignal:
+            def connect(self, _slot):
+                return None
+
+        class _DummyWorker:
+            def __init__(self, *args, **kwargs):
+                self.row_ready = _DummySignal()
+                self.failed_item = _DummySignal()
+                self.progress = _DummySignal()
+                self.completed = _DummySignal()
+                self.fatal_error = _DummySignal()
+                self.started = False
+
+            def submit(self, media_type: str, path: str):
+                return None
+
+            def finish(self, expected_total: int):
+                return None
+
+            def start(self):
+                self.started = True
+
+            def isRunning(self):
+                return False
+
+            def cancel(self):
+                return None
+
+            def wait(self):
+                return True
+
+        dummy_store = _DummyStore(Path(self._tmp.name) / "scan.db")
+        real_store = self.window._scan_store
+        real_store.close()
+        self.window._scan_store = dummy_store
+        self.window._active_source_roots = [self._tmp.name]
+
+        with mock.patch("reencode.main_window._MetadataProbeWorker", _DummyWorker):
+            self.window._on_file_found(scan_token=42, media_type="Videos", path=str(Path(self._tmp.name) / "video.mp4"))
+            self.assertEqual(dummy_store.commit_calls, 0)
+
+            self.window._on_discovery_finished(
+                scan_token=42,
+                _phase="discovery",
+                count=1,
+                cancelled=False,
+            )
+
+        self.assertEqual(dummy_store.commit_calls, 1)
+
     def test_failure_routing_buffers_and_flushes(self):
         bad_path = str(Path(self._tmp.name) / "bad.mp4")
 

@@ -382,6 +382,7 @@ class MediaPanel(QWidget):
         self._pagination_page_size = self._load_page_size_setting()
         self._pagination_page = self._load_page_setting()
         self._pagination_restoring = False
+        self._pagination_last_state: tuple[int, int, int] | None = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -589,8 +590,22 @@ class MediaPanel(QWidget):
         else:
             start = self._pagination_page * self._pagination_page_size
             end = start + self._pagination_page_size
-            for row in range(self._table.rowCount()):
-                self._table.setRowHidden(row, row < start or row >= end)
+            row_count = self._table.rowCount()
+            previous_state = self._pagination_last_state
+
+            if previous_state is None:
+                for row in range(row_count):
+                    self._table.setRowHidden(row, row < start or row >= end)
+            elif previous_state[0] == start and previous_state[1] == end:
+                previous_row_count = previous_state[2]
+                if row_count > previous_row_count:
+                    for row in range(previous_row_count, row_count):
+                        self._table.setRowHidden(row, row < start or row >= end)
+            else:
+                for row in range(row_count):
+                    self._table.setRowHidden(row, row < start or row >= end)
+
+            self._pagination_last_state = (start, end, row_count)
 
         self._refresh_pagination_controls()
         if save_settings and not self._pagination_restoring:
@@ -983,6 +998,7 @@ class MediaPanel(QWidget):
             self._table.setItem(row, COL_MODIFIED, modified_item)
 
         self._path_rows[path] = row
+        self._path_rows_dirty = False
 
     def _format_modified(self, modified_timestamp: str) -> str:
         if not modified_timestamp:
@@ -1006,7 +1022,6 @@ class MediaPanel(QWidget):
 
         self._suspend_check_updates = False
         self._table.setSortingEnabled(True)
-        self._invalidate_path_rows()
         self._apply_pagination(save_settings=False)
         self._update_label()
         if self._supports_conversion:
@@ -1034,7 +1049,6 @@ class MediaPanel(QWidget):
 
         self._suspend_check_updates = False
         self._table.setSortingEnabled(True)
-        self._invalidate_path_rows()
         self._apply_pagination(save_settings=False)
         self._update_label()
         if self._supports_conversion:
@@ -1065,7 +1079,7 @@ class MediaPanel(QWidget):
             for raw_row in rows:
                 path, size_bytes, modified_timestamp, estimate_bytes = _unpack_row(raw_row)
                 if estimate_bytes is not None and estimate_bytes >= 0:
-                    savings_ratio = max(0.0, min(0.99, 1.0 - (estimate_bytes / size_bytes))) if size_bytes > 0 else None
+                    savings_ratio = (1.0 - (estimate_bytes / size_bytes)) if size_bytes > 0 else None
                     estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
                     estimate_sort = estimate_bytes
                 else:
@@ -1109,7 +1123,7 @@ class MediaPanel(QWidget):
                     self._table.setItem(table_row, VCOL_SIZE, size_item)
                     self._table.setItem(table_row, VCOL_MODIFIED, modified_item)
                     if estimate_bytes is not None and estimate_bytes >= 0:
-                        savings_ratio = max(0.0, min(0.99, 1.0 - (estimate_bytes / size_bytes))) if size_bytes > 0 else None
+                        savings_ratio = (1.0 - (estimate_bytes / size_bytes)) if size_bytes > 0 else None
                         estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
                         estimate_item = _NumericItem(estimate_text, estimate_bytes)
                         estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1121,7 +1135,7 @@ class MediaPanel(QWidget):
                     self._table.setItem(table_row, COL_SIZE, size_item)
                     self._table.setItem(table_row, COL_MODIFIED, modified_item)
                     if estimate_bytes is not None and estimate_bytes >= 0:
-                        savings_ratio = max(0.0, min(0.99, 1.0 - (estimate_bytes / size_bytes))) if size_bytes > 0 else None
+                        savings_ratio = (1.0 - (estimate_bytes / size_bytes)) if size_bytes > 0 else None
                         estimate_text = size_estimator.format_estimate(_human_size(estimate_bytes), savings_ratio)
                         estimate_item = _NumericItem(estimate_text, estimate_bytes)
                         estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1156,6 +1170,7 @@ class MediaPanel(QWidget):
     def _restore_sorting_after_probe(self):
         self._table.setSortingEnabled(True)
         self._invalidate_path_rows()
+        self._pagination_last_state = None
 
     def update_probes(self, updates: list[tuple[str, dict | None]]):
         if not updates:
@@ -1239,6 +1254,7 @@ class MediaPanel(QWidget):
             assert self._virtual_model is not None
             self._virtual_model.clear_rows()
             self._pagination_page = 0
+            self._pagination_last_state = None
             self._apply_pagination(save_settings=True)
             self._update_label()
             return
@@ -1249,6 +1265,7 @@ class MediaPanel(QWidget):
         self._table.setRowCount(0)
         self._suspend_check_updates = False
         self._pagination_page = 0
+        self._pagination_last_state = None
         self._apply_pagination(save_settings=True)
         self._update_label()
         if self._supports_conversion:

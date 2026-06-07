@@ -98,4 +98,6 @@ def format_estimate(human_size_text: str, savings_ratio: float | None) -> str:
     """Return display text for estimate cell."""
     if savings_ratio is None:
         return human_size_text
-    return f"{human_size_text} ({savings_ratio * 100:.0f}% smaller)"
+    change_pct = -savings_ratio * 100
+    sign = "+" if change_pct >= 0 else ""
+    return f"{human_size_text} ({sign}{change_pct:.0f}%)"

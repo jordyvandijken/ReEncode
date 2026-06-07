@@ -18,6 +18,32 @@ from reencode import size_estimator
 from reencode.sources_panel import SourcesPanel
 
 
+class _LazyScanStore:
+    def __init__(self):
+        self._store: ScanStore | None = None
+
+    @property
+    def db_path(self) -> Path:
+        return self._ensure().db_path
+
+    def _ensure(self) -> ScanStore:
+        if self._store is None:
+            self._store = ScanStore()
+        return self._store
+
+    def upsert_record(self, *args, **kwargs):
+        return self._ensure().upsert_record(*args, **kwargs)
+
+    def prune_scan_scope(self, *args, **kwargs) -> int:
+        return self._ensure().prune_scan_scope(*args, **kwargs)
+
+    def close(self):
+        if self._store is None:
+            return
+        self._store.close()
+        self._store = None
+
+
 class _MetadataProbeWorker(QThread):
     row_ready = Signal(int, str, str, object, str, object, object, object, object)
     failed_item = Signal(int, str, str, str, str)
@@ -215,7 +241,7 @@ class MainWindow(QMainWindow):
         self._pending_failed_rows: list[tuple[str, str, str]] = []
 
         self._metadata_processed = 0
-        self._scan_store = ScanStore()
+        self._scan_store: ScanStore | _LazyScanStore = _LazyScanStore()
 
         self._metadata_flush_timer = QTimer(self)
         self._metadata_flush_timer.setInterval(100)
@@ -237,6 +263,11 @@ class MainWindow(QMainWindow):
         self._scan_started_at_epoch: int | None = None
 
         self._setup_ui()
+
+    def _get_scan_store(self) -> ScanStore:
+        if isinstance(self._scan_store, _LazyScanStore):
+            return self._scan_store._ensure()
+        return self._scan_store
 
     def _setup_ui(self):
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -389,14 +420,14 @@ class MainWindow(QMainWindow):
 
         source_root = self._source_root_for_path(path)
         try:
-            self._scan_store.upsert_record(
+            self._get_scan_store().upsert_record(
                 absolute_path=path,
                 source_root=source_root,
                 media_type=media_type,
                 file_size=0,
                 last_modified=0,
                 scanned_at=int(time.time()),
-                commit=True,
+                commit=False,
             )
         except Exception as exc:
             self._pending_failed_rows.append(
@@ -424,6 +455,13 @@ class MainWindow(QMainWindow):
             self._scanner.deleteLater()
             self._scanner = None
 
+        try:
+            self._get_scan_store().commit()
+        except Exception as exc:
+            self._pending_failed_rows.append(("Discovery commit", f"Storage commit failed: {exc} ({ScanPhase.STORAGE.value})", ""))
+            if not self._failed_flush_timer.isActive():
+                self._failed_flush_timer.start()
+
         self._discovery_finished = True
         self._discovery_count = count
 
@@ -438,9 +476,10 @@ class MainWindow(QMainWindow):
             return
 
         self._scan_state = ScanState.METADATA
+        store = self._get_scan_store()
         self._metadata_probe_worker = _MetadataProbeWorker(
             self._scan_token,
-            str(self._scan_store.db_path),
+            str(store.db_path),
             self._active_source_roots,
             parent=self,
         )
