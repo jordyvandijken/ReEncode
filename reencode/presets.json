@@ -1,0 +1,155 @@
+{
+    "presets": [
+        {
+            "id": "archive",
+            "name": "Archive",
+            "description": "Prioritizes long-term storage efficiency while preserving visual and audio quality. Encoding speed is less important than compression efficiency.",
+            "media": {
+                "image": {
+                    "codec": "JPEG XL",
+                    "mode": "Lossless or visually lossless",
+                    "info": "Excellent compression, supports HDR, metadata, animation, and future-proof archival storage."
+                },
+                "video": {
+                    "codec": "AV1",
+                    "mode": "High quality",
+                    "info": "Industry-leading compression efficiency for archival video collections."
+                },
+                "audio": {
+                    "codec": "FLAC",
+                    "mode": "Lossless",
+                    "info": "Preserves original audio quality while reducing storage requirements."
+                }
+            }
+        },
+        {
+            "id": "streaming",
+            "name": "Streaming",
+            "description": "Optimized for Plex, Jellyfin, smart TVs, mobile devices, and broad hardware compatibility.",
+            "media": {
+                "image": {
+                    "codec": "WebP",
+                    "mode": "Lossy",
+                    "info": "Efficient image format with widespread browser and application support."
+                },
+                "video": {
+                    "codec": "HEVC (H.265)",
+                    "mode": "Balanced quality",
+                    "info": "Excellent hardware decoding support and commonly direct-plays on media server clients."
+                },
+                "audio": {
+                    "codec": "AAC",
+                    "mode": "Lossy",
+                    "info": "Highly compatible audio codec supported by nearly all devices."
+                }
+            }
+        },
+        {
+            "id": "modern_streaming",
+            "name": "Modern Streaming",
+            "description": "Targets newer devices and software with support for next-generation codecs.",
+            "media": {
+                "image": {
+                    "codec": "JPEG XL",
+                    "mode": "Lossy",
+                    "info": "Better compression than traditional web formats while maintaining high image quality."
+                },
+                "video": {
+                    "codec": "AV1",
+                    "mode": "Balanced quality",
+                    "info": "Superior compression efficiency with growing hardware support."
+                },
+                "audio": {
+                    "codec": "Opus",
+                    "mode": "Lossy",
+                    "info": "Excellent audio quality at low bitrates and ideal for streaming."
+                }
+            }
+        },
+        {
+            "id": "space_saver",
+            "name": "Space Saver",
+            "description": "Aggressively reduces storage usage while maintaining acceptable playback quality.",
+            "media": {
+                "image": {
+                    "codec": "JPEG XL",
+                    "mode": "Lossy",
+                    "info": "Strong image compression focused on minimizing file size."
+                },
+                "video": {
+                    "codec": "AV1",
+                    "mode": "Aggressive compression",
+                    "info": "Maximizes space savings with reduced bitrate targets."
+                },
+                "audio": {
+                    "codec": "Opus",
+                    "mode": "Low bitrate",
+                    "info": "Retains good listening quality while minimizing storage usage."
+                }
+            }
+        },
+        {
+            "id": "compatibility",
+            "name": "Compatibility",
+            "description": "Designed for maximum playback support across older devices, browsers, and software.",
+            "media": {
+                "image": {
+                    "codec": "JPEG",
+                    "mode": "Lossy",
+                    "info": "Universally supported image format."
+                },
+                "video": {
+                    "codec": "H.264",
+                    "mode": "Balanced quality",
+                    "info": "Most widely supported video codec available."
+                },
+                "audio": {
+                    "codec": "AAC",
+                    "mode": "Lossy",
+                    "info": "Broad support across operating systems and media players."
+                }
+            }
+        },
+        {
+            "id": "lossless_archive",
+            "name": "Lossless Archive",
+            "description": "Preserves all source data without quality loss, prioritizing fidelity over storage efficiency.",
+            "media": {
+                "image": {
+                    "codec": "JPEG XL",
+                    "mode": "Lossless",
+                    "info": "Retains original image data while reducing storage requirements."
+                },
+                "video": {
+                    "codec": "FFV1",
+                    "mode": "Lossless",
+                    "info": "Archival-grade lossless video compression suitable for preservation."
+                },
+                "audio": {
+                    "codec": "FLAC",
+                    "mode": "Lossless",
+                    "info": "Bit-perfect audio preservation with reduced file size."
+                }
+            }
+        },
+        {
+            "id": "keep_original",
+            "name": "Keep Original Codec",
+            "description": "Preserves the source codec and only re-encodes when a format is unsupported or explicitly requested.",
+            "media": {
+                "image": {
+                    "codec": "Original",
+                    "info": "Avoids unnecessary generation loss."
+                },
+                "video": {
+                    "codec": "Original",
+                    "info": "Skips transcoding when no significant benefit is expected."
+                },
+                "audio": {
+                    "codec": "Original",
+                    "info": "Prevents quality degradation from lossy-to-lossy conversions."
+                }
+            }
+        }
+    ]
+}

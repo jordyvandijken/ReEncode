@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from reencode import codec_probe
+from reencode import presets as presets_data
 from reencode import size_estimator
 from reencode.subprocess_util import popen_hidden
 from reencode.virtual_media_model import VirtualMediaTableModel, recommendation_color
@@ -113,6 +114,82 @@ _COLOR_REENCODE = QColor("#e65100")   # dark orange
 _COLOR_PENDING  = QColor("#616161")   # neutral gray
 _PAGE_SIZE_OPTIONS = (25, 50, 100, 250)
 
+_VIDEO_CODEC_ENCODER_ARGS: dict[str, list[str]] = {
+    "av1": ["-c:v", "libaom-av1", "-crf", "32", "-b:v", "0", "-cpu-used", "6"],
+    "vp9": ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0"],
+    "h264": ["-c:v", "libx264", "-crf", "23", "-preset", "medium"],
+    "hevc": ["-c:v", "libx265", "-crf", "28", "-preset", "medium"],
+    "ffv1": ["-c:v", "ffv1"],
+}
+
+_AUDIO_CODEC_ENCODER_ARGS: dict[str, list[str]] = {
+    "aac": ["-c:a", "aac", "-b:a", "192k"],
+    "opus": ["-c:a", "libopus", "-b:a", "128k"],
+    "flac": ["-c:a", "flac"],
+    "mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+}
+
+_IMAGE_CODEC_ENCODER_ARGS: dict[str, list[str]] = {
+    "webp": ["-c:v", "libwebp", "-quality", "80"],
+    "jpeg": ["-c:v", "mjpeg", "-q:v", "3"],
+    "jxl": ["-c:v", "libjxl", "-distance", "1.0"],
+}
+
+_IMAGE_EXTENSION_TO_CODEC: dict[str, str] = {
+    ".webp": "webp",
+    ".jpg": "jpeg",
+    ".jpeg": "jpeg",
+    ".jxl": "jxl",
+    ".png": "png",
+}
+
+_AUDIO_CODEC_TO_EXTENSION: dict[str, str] = {
+    "aac": ".m4a",
+    "opus": ".opus",
+    "flac": ".flac",
+    "mp3": ".mp3",
+}
+
+_IMAGE_CODEC_TO_EXTENSION: dict[str, str] = {
+    "webp": ".webp",
+    "jpeg": ".jpg",
+    "jxl": ".jxl",
+    "png": ".png",
+}
+
+
+def _normalize_codec_name(value: str | None) -> str:
+    if not value:
+        return ""
+    label = value.strip().lower()
+    if "original" in label:
+        return "original"
+    if "av1" in label:
+        return "av1"
+    if "vp9" in label:
+        return "vp9"
+    if "h.264" in label or "avc" in label or label == "h264":
+        return "h264"
+    if "h.265" in label or "hevc" in label or label == "h265":
+        return "hevc"
+    if "ffv1" in label:
+        return "ffv1"
+    if "aac" in label:
+        return "aac"
+    if "opus" in label:
+        return "opus"
+    if "flac" in label:
+        return "flac"
+    if "mp3" in label:
+        return "mp3"
+    if "jpeg xl" in label or label == "jxl":
+        return "jxl"
+    if "webp" in label:
+        return "webp"
+    if label in {"jpeg", "jpg", "mjpeg"}:
+        return "jpeg"
+    return label
+
 
 def _columns_for_media_type(media_type: str, supports_conversion: bool) -> list[str]:
     if media_type == "Images":
@@ -120,23 +197,25 @@ def _columns_for_media_type(media_type: str, supports_conversion: bool) -> list[
     return SELECTABLE_COLUMNS if supports_conversion else BASE_COLUMNS
 
 
-def _recommended_ffmpeg_args(recommended_label: str) -> list[str]:
-    label = recommended_label.lower()
-    if "av1" in label:
-        return ["-c:v", "libaom-av1", "-crf", "32", "-b:v", "0", "-cpu-used", "6"]
-    if "vp9" in label:
-        return ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0"]
-    if "h.264" in label or "avc" in label:
-        return ["-c:v", "libx264", "-crf", "23", "-preset", "medium"]
-    return ["-c:v", "libx265", "-crf", "28", "-preset", "medium"]
+def _recommended_ffmpeg_args(recommended_label: str, source_codec: str | None = None) -> list[str]:
+    codec_name = _normalize_codec_name(recommended_label)
+    if codec_name == "original":
+        codec_name = _normalize_codec_name(source_codec)
+    return _VIDEO_CODEC_ENCODER_ARGS.get(codec_name, _VIDEO_CODEC_ENCODER_ARGS["hevc"])
 
 
-def _recommended_audio_ffmpeg_args() -> list[str]:
-    return ["-c:a", "aac", "-b:a", "192k"]
+def _recommended_audio_ffmpeg_args(recommended_label: str, source_codec: str | None = None) -> list[str]:
+    codec_name = _normalize_codec_name(recommended_label)
+    if codec_name == "original":
+        codec_name = _normalize_codec_name(source_codec)
+    return _AUDIO_CODEC_ENCODER_ARGS.get(codec_name, _AUDIO_CODEC_ENCODER_ARGS["aac"])
 
 
-def _recommended_image_ffmpeg_args() -> list[str]:
-    return ["-c:v", "libwebp", "-quality", "80"]
+def _recommended_image_ffmpeg_args(recommended_label: str, source_path: str) -> list[str]:
+    codec_name = _normalize_codec_name(recommended_label)
+    if codec_name == "original":
+        codec_name = _IMAGE_EXTENSION_TO_CODEC.get(Path(source_path).suffix.lower(), "webp")
+    return _IMAGE_CODEC_ENCODER_ARGS.get(codec_name, _IMAGE_CODEC_ENCODER_ARGS["webp"])
 
 
 def _recommended_video_output_path(path: str, recommended_label: str) -> str:
@@ -157,31 +236,37 @@ def _recommended_video_output_path(path: str, recommended_label: str) -> str:
         index += 1
 
 
-def _recommended_audio_output_path(path: str) -> str:
+def _recommended_audio_output_path(path: str, recommended_label: str) -> str:
     source = Path(path)
-    candidate = source.with_name(f"{source.stem}.reencoded.m4a")
+    codec_name = _normalize_codec_name(recommended_label)
+    output_suffix = _AUDIO_CODEC_TO_EXTENSION.get(codec_name, ".m4a")
+    candidate = source.with_name(f"{source.stem}.reencoded{output_suffix}")
 
     if not candidate.exists():
         return str(candidate)
 
     index = 2
     while True:
-        next_candidate = source.with_name(f"{source.stem}.reencoded-{index}.m4a")
+        next_candidate = source.with_name(f"{source.stem}.reencoded-{index}{output_suffix}")
         if not next_candidate.exists():
             return str(next_candidate)
         index += 1
 
 
-def _recommended_image_output_path(path: str) -> str:
+def _recommended_image_output_path(path: str, recommended_label: str) -> str:
     source = Path(path)
-    candidate = source.with_name(f"{source.stem}.reencoded.webp")
+    codec_name = _normalize_codec_name(recommended_label)
+    if codec_name == "original":
+        codec_name = _IMAGE_EXTENSION_TO_CODEC.get(source.suffix.lower(), "webp")
+    output_suffix = _IMAGE_CODEC_TO_EXTENSION.get(codec_name, ".webp")
+    candidate = source.with_name(f"{source.stem}.reencoded{output_suffix}")
 
     if not candidate.exists():
         return str(candidate)
 
     index = 2
     while True:
-        next_candidate = source.with_name(f"{source.stem}.reencoded-{index}.webp")
+        next_candidate = source.with_name(f"{source.stem}.reencoded-{index}{output_suffix}")
         if not next_candidate.exists():
             return str(next_candidate)
         index += 1
@@ -191,8 +276,8 @@ def _recommended_output_path(media_type: str, path: str, recommended_label: str)
     if media_type == "Videos":
         return _recommended_video_output_path(path, recommended_label)
     if media_type == "Audio":
-        return _recommended_audio_output_path(path)
-    return _recommended_image_output_path(path)
+        return _recommended_audio_output_path(path, recommended_label)
+    return _recommended_image_output_path(path, recommended_label)
 
 
 def _temporary_output_path(final_output_path: str) -> str:
@@ -214,18 +299,20 @@ class _ConversionThread(QThread):
 
     def _job_conversion_inputs(self, media_type: str, source_path: str, recommended_label: str) -> tuple[list[str], float | None]:
         probe_info = codec_probe.probe_media_info(source_path) or {}
+        source_video_codec = str(probe_info.get("video_codec") or "")
+        source_audio_codec = str(probe_info.get("audio_codec") or "")
 
         if media_type == "Videos":
-            codec_name = (probe_info.get("video_codec") or "").lower()
+            codec_name = source_video_codec.lower()
             if not recommended_label:
                 _status, recommended_label, _reason = codec_probe.recommendation(codec_name)
-            ffmpeg_args = _recommended_ffmpeg_args(recommended_label)
+            ffmpeg_args = _recommended_ffmpeg_args(recommended_label, source_codec=source_video_codec)
             duration_seconds = probe_info.get("duration")
         elif media_type == "Audio":
-            ffmpeg_args = _recommended_audio_ffmpeg_args()
+            ffmpeg_args = _recommended_audio_ffmpeg_args(recommended_label, source_codec=source_audio_codec)
             duration_seconds = probe_info.get("duration")
         else:
-            ffmpeg_args = _recommended_image_ffmpeg_args()
+            ffmpeg_args = _recommended_image_ffmpeg_args(recommended_label, source_path)
             duration_seconds = None
 
         if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
@@ -383,7 +470,65 @@ class MediaPanel(QWidget):
         self._pagination_page = self._load_page_setting()
         self._pagination_restoring = False
         self._pagination_last_state: tuple[int, int, int] | None = None
+        self._probe_by_path: dict[str, dict | None] = {}
+        self._presets_by_id = presets_data.presets_by_id(presets_data.load_presets())
+        self._active_preset_id: str | None = None
         self._setup_ui()
+
+    def set_active_preset(self, preset_id: str | None):
+        self._active_preset_id = preset_id
+        self._refresh_recommendations_for_active_preset()
+
+    def _active_preset_entry(self) -> presets_data.PresetMediaEntry | None:
+        preset = self._presets_by_id.get(self._active_preset_id or "")
+        return presets_data.media_entry_for_type(preset, self._media_type)
+
+    def _preset_reason(self, entry: presets_data.PresetMediaEntry | None, default_text: str) -> str:
+        if entry is None:
+            return default_text
+
+        parts: list[str] = []
+        if entry.mode:
+            parts.append(entry.mode)
+        if entry.info:
+            parts.append(entry.info)
+        return " ".join(parts) if parts else default_text
+
+    def _refresh_recommendations_for_active_preset(self):
+        if self.file_count() == 0:
+            return
+
+        if self._use_virtual_table:
+            assert self._virtual_model is not None
+            row_updates: dict[str, dict] = {}
+            for row_data in self._virtual_model._rows:
+                path = str(row_data.get("path") or "")
+                if not path:
+                    continue
+                probe_info = self._probe_by_path.get(path)
+                codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
+                row_updates[path] = {
+                    "codec": codec_text,
+                    "recommend": rec_label,
+                    "rec_reason": reason,
+                    "rec_color": recommendation_color(status),
+                }
+            self._virtual_model.update_rows(row_updates)
+            return
+
+        self._table.setSortingEnabled(False)
+        self._table.setUpdatesEnabled(False)
+        try:
+            path_col = self._path_column()
+            for row in range(self._table.rowCount()):
+                path_item = self._table.item(row, path_col)
+                if path_item is None:
+                    continue
+                path = path_item.text()
+                self._apply_probe_update(path, self._probe_by_path.get(path))
+        finally:
+            self._table.setUpdatesEnabled(True)
+            self._table.setSortingEnabled(True)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -728,10 +873,10 @@ class MediaPanel(QWidget):
         raw_codec = (probe_info or {}).get("video_codec")
         if raw_codec:
             codec_text = codec_probe.codec_label(raw_codec)
-            status, rec_label, reason = codec_probe.recommendation(raw_codec)
+            rec_label, reason, status = self._recommended_values(path, str(raw_codec), codec_text)
         else:
             codec_text = "Probing..."
-            status, rec_label, reason = "pending", "Pending probe", "Codec details will appear after the async probe phase."
+            rec_label, reason, status = self._recommended_values(path, None, codec_text)
 
         if probe_info is None:
             estimate_item = _NumericItem("Pending probe", -1)
@@ -852,29 +997,58 @@ class MediaPanel(QWidget):
         if self._media_type == "Images":
             file_ext = os.path.splitext(path)[1].lower()
             if file_ext:
-                status = "optimal" if file_ext == ".webp" else "good"
-                return file_ext, ".webp", "Images convert to .webp by default.", status
-            return "Unknown", ".webp", "File extension could not be determined.", "pending"
+                rec_label, reason, status = self._recommended_values(path, file_ext, file_ext)
+                return file_ext, rec_label, reason, status
+            rec_label, reason, status = self._recommended_values(path, None, "Unknown")
+            return "Unknown", rec_label, reason, status
 
         if self._media_type == "Audio":
             raw_codec = (probe_info or {}).get("audio_codec")
             if raw_codec:
                 codec_text = codec_probe.codec_label(raw_codec)
-                status, rec_label, reason = codec_probe.recommendation(raw_codec)
+                rec_label, reason, status = self._recommended_values(path, str(raw_codec), codec_text)
             elif probe_info is None:
                 codec_text = "Probing..."
-                status, rec_label, reason = (
-                    "pending",
-                    "Pending probe",
-                    "Codec details will appear after the async probe phase.",
-                )
+                rec_label, reason, status = self._recommended_values(path, None, codec_text)
             else:
                 codec_text = "Unknown"
-                status, rec_label, reason = ("pending", "Pending probe", "No audio codec details were reported.")
+                rec_label, reason, status = self._recommended_values(path, None, codec_text)
         else:
             codec_text = "-"
             status, rec_label, reason = ("pending", "-", "Recommendations are only available for audio/video codecs.")
         return codec_text, rec_label, reason, status
+
+    def _recommended_values(self, path: str, raw_codec: str | None, codec_text: str) -> tuple[str, str, str]:
+        entry = self._active_preset_entry()
+        if entry is None:
+            if self._media_type == "Images":
+                file_ext = os.path.splitext(path)[1].lower()
+                if file_ext:
+                    status = "optimal" if file_ext == ".webp" else "good"
+                    return ".webp", "Images convert to .webp by default.", status
+                return ".webp", "File extension could not be determined.", "pending"
+
+            if raw_codec:
+                status, rec_label, reason = codec_probe.recommendation(raw_codec)
+                return rec_label, reason, status
+            return "Pending probe", "Codec details will appear after the async probe phase.", "pending"
+
+        target_codec = entry.codec
+        target_norm = _normalize_codec_name(target_codec)
+        source_norm = _normalize_codec_name(raw_codec)
+
+        if target_norm == "original":
+            if raw_codec:
+                return codec_text, self._preset_reason(entry, "Uses the source codec."), "optimal"
+            return "Original", self._preset_reason(entry, "Uses the source codec."), "pending"
+
+        status = "reencode"
+        if source_norm and source_norm == target_norm:
+            status = "optimal"
+        elif self._media_type == "Images" and raw_codec:
+            status = "good"
+
+        return target_codec, self._preset_reason(entry, f"Target codec: {target_codec}"), status
 
     def _virtual_row(self, path: str, size_bytes: int, modified_timestamp: str, probe_info: dict | None) -> dict:
         codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
@@ -946,6 +1120,7 @@ class MediaPanel(QWidget):
             QMessageBox.warning(self, "Convert selected", message[:1000])
 
     def _insert_file_row(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
+        self._probe_by_path.setdefault(path, None)
         row = self._table.rowCount()
         self._table.insertRow(row)
 
@@ -1197,6 +1372,9 @@ class MediaPanel(QWidget):
         if not updates:
             return
 
+        for path, probe_info in updates:
+            self._probe_by_path[path] = probe_info
+
         if self._use_virtual_table:
             assert self._virtual_model is not None
             restore_sorting = False
@@ -1243,6 +1421,11 @@ class MediaPanel(QWidget):
             self._table.setSortingEnabled(True)
 
     def _apply_probe_update(self, path: str, probe_info: dict | None):
+        if probe_info is not None:
+            self._probe_by_path[path] = probe_info
+        elif path in self._probe_by_path:
+            probe_info = self._probe_by_path[path]
+
         row = self._row_for_path(path)
         if row is None:
             return
@@ -1275,6 +1458,7 @@ class MediaPanel(QWidget):
         if self._use_virtual_table:
             assert self._virtual_model is not None
             self._virtual_model.clear_rows()
+            self._probe_by_path.clear()
             self._pagination_page = 0
             self._pagination_last_state = None
             self._apply_pagination(save_settings=True)
@@ -1282,6 +1466,7 @@ class MediaPanel(QWidget):
             return
 
         self._suspend_check_updates = True
+        self._probe_by_path.clear()
         self._path_rows.clear()
         self._path_rows_dirty = False
         self._table.setRowCount(0)

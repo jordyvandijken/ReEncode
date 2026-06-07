@@ -255,6 +255,42 @@ class MediaPanelConversionParityTests(unittest.TestCase):
         finally:
             panel.close()
 
+    def test_video_recommendation_updates_when_preset_changes(self):
+        panel = MediaPanel("Videos")
+        try:
+            path = "C:/tmp/video.mp4"
+            panel.add_file(path, 2048, "1")
+            panel.update_probes([(path, {"video_codec": "h264", "duration": 10.0})])
+
+            panel.set_active_preset("compatibility")
+            rec_item = panel._table.item(0, VCOL_REC)
+            self.assertIsNotNone(rec_item)
+            assert rec_item is not None
+            self.assertEqual(rec_item.text(), "H.264")
+
+            panel.set_active_preset("archive")
+            rec_item = panel._table.item(0, VCOL_REC)
+            self.assertIsNotNone(rec_item)
+            assert rec_item is not None
+            self.assertEqual(rec_item.text(), "AV1")
+        finally:
+            panel.close()
+
+    def test_audio_keep_original_recommendation_uses_source_codec_label(self):
+        panel = MediaPanel("Audio")
+        try:
+            path = "C:/tmp/audio.mp3"
+            panel.add_file(path, 1024, "1")
+            panel.update_probes([(path, {"audio_codec": "aac", "duration": 3.0})])
+            panel.set_active_preset("keep_original")
+
+            rec_item = panel._table.item(0, VCOL_REC)
+            self.assertIsNotNone(rec_item)
+            assert rec_item is not None
+            self.assertEqual(rec_item.text(), "AAC")
+        finally:
+            panel.close()
+
 
 if __name__ == "__main__":
     unittest.main()

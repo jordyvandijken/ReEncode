@@ -435,6 +435,13 @@ class MainWindowScanContractTests(unittest.TestCase):
         self.assertFalse(self.window._failed_panel._scan_locked)
         self.assertTrue(self.window._failed_panel._table.isEnabled())
 
+    def test_preset_selection_propagates_to_all_media_panels(self):
+        self.window._on_preset_selected("streaming")
+
+        self.assertEqual(self.window._selected_preset_id, "streaming")
+        for panel in self.window._panels.values():
+            self.assertEqual(panel._active_preset_id, "streaming")
+
 
 if __name__ == "__main__":
     unittest.main()

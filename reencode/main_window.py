@@ -4,6 +4,7 @@ from time import perf_counter
 import math
 import time
 from pathlib import Path
+from PySide6.QtCore import QSettings
 
 from PySide6.QtCore import QThread, Qt, Signal, QTimer
 from PySide6.QtWidgets import QMainWindow, QSplitter, QStatusBar, QTabWidget
@@ -212,6 +213,8 @@ class _MetadataProbeWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    _PRESET_SETTINGS_KEY = "presets/selected_id"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ReEncode — Media Scanner")
@@ -230,6 +233,8 @@ class MainWindow(QMainWindow):
         self._worker_processed_count = 0
         self._worker_probed_count = 0
         self._cancel_requested = False
+        self._settings = QSettings()
+        self._selected_preset_id: str | None = None
 
         self._discovery_progress_count = 0
         self._metadata_total = 0
@@ -263,6 +268,7 @@ class MainWindow(QMainWindow):
         self._scan_started_at_epoch: int | None = None
 
         self._setup_ui()
+        self._restore_selected_preset()
 
     def _get_scan_store(self) -> ScanStore:
         if isinstance(self._scan_store, _LazyScanStore):
@@ -278,6 +284,7 @@ class MainWindow(QMainWindow):
         self._sources_panel.setMaximumWidth(360)
         self._sources_panel.scan_requested.connect(self._start_scan)
         self._sources_panel.cancel_requested.connect(self._cancel_scan)
+        self._sources_panel.preset_selected.connect(self._on_preset_selected)
         splitter.addWidget(self._sources_panel)
 
         self._tab_widget = QTabWidget()
@@ -298,6 +305,24 @@ class MainWindow(QMainWindow):
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Ready. Add folders and click Scan.")
+
+    def _on_preset_selected(self, preset_id: str):
+        self._selected_preset_id = preset_id
+        self._settings.setValue(self._PRESET_SETTINGS_KEY, preset_id)
+        self._sources_panel.set_selected_preset(preset_id)
+
+        for panel in self._panels.values():
+            panel.set_active_preset(preset_id)
+
+        self._status_bar.showMessage(f"Preset applied: {preset_id}")
+
+    def _restore_selected_preset(self):
+        value = self._settings.value(self._PRESET_SETTINGS_KEY)
+        preset_id = value if isinstance(value, str) and value else None
+        self._selected_preset_id = preset_id
+        self._sources_panel.set_selected_preset(preset_id)
+        for panel in self._panels.values():
+            panel.set_active_preset(preset_id)
 
     def _start_scan(self, folders: list[str]):
         self._scan_token += 1
