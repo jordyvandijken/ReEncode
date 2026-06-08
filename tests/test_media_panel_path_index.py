@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtWidgets import QApplication, QAbstractItemView
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QDialog
 
-from reencode.media_panel import FailedPanel, MediaPanel, VCOL_CODEC, VCOL_ESTIMATE, VCOL_REC, VCOL_SELECT
+from reencode.media_panel import (
+    _GPU_SETTING_KEY,
+    FailedPanel,
+    MediaPanel,
+    VCOL_CODEC,
+    VCOL_ESTIMATE,
+    VCOL_REC,
+    VCOL_SELECT,
+)
 
 
 class MediaPanelPathIndexTests(unittest.TestCase):
@@ -229,6 +238,58 @@ class MediaPanelConversionParityTests(unittest.TestCase):
         finally:
             panel.close()
 
+    def test_convert_selected_cancel_does_not_start_conversion(self):
+        panel = MediaPanel("Audio")
+        try:
+            panel.add_file("C:/tmp/song.mp3", 1000, "1")
+            select_item = panel._table.item(0, VCOL_SELECT)
+            self.assertIsNotNone(select_item)
+            assert select_item is not None
+            select_item.setCheckState(Qt.CheckState.Checked)
+
+            with mock.patch("reencode.media_panel._ConvertOptionsDialog") as dialog_cls:
+                dialog_cls.return_value.exec.return_value = QDialog.DialogCode.Rejected
+                with mock.patch("reencode.media_panel._ConversionThread") as thread_cls:
+                    panel._convert_selected()
+
+            self.assertEqual(dialog_cls.call_count, 1)
+            self.assertEqual(thread_cls.call_count, 0)
+            self.assertIsNone(panel._conversion_thread)
+        finally:
+            panel.close()
+
+    def test_convert_selected_confirm_starts_thread_and_persists_gpu_setting(self):
+        panel = MediaPanel("Audio")
+        try:
+            panel._settings = mock.Mock()
+            panel._settings.value.return_value = "1"
+            panel.add_file("C:/tmp/song.mp3", 1000, "1")
+            select_item = panel._table.item(0, VCOL_SELECT)
+            self.assertIsNotNone(select_item)
+            assert select_item is not None
+            select_item.setCheckState(Qt.CheckState.Checked)
+
+            with mock.patch("reencode.media_panel._ConvertOptionsDialog") as dialog_cls:
+                dialog_instance = dialog_cls.return_value
+                dialog_instance.exec.return_value = QDialog.DialogCode.Accepted
+                dialog_instance.do_not_replace.return_value = True
+                dialog_instance.use_gpu.return_value = False
+
+                with mock.patch("reencode.media_panel._ConversionThread") as thread_cls:
+                    thread_instance = thread_cls.return_value
+                    thread_instance.progress.connect = mock.Mock()
+                    thread_instance.finished.connect = mock.Mock()
+                    thread_instance.start = mock.Mock()
+
+                    panel._convert_selected()
+
+            self.assertEqual(dialog_cls.call_count, 1)
+            self.assertEqual(thread_cls.call_count, 1)
+            self.assertEqual(thread_cls.call_args.kwargs.get("use_gpu"), False)
+            panel._settings.setValue.assert_called_once_with(_GPU_SETTING_KEY, False)
+        finally:
+            panel.close()
+
     def test_images_panel_forces_copy_mode(self):
         panel = MediaPanel("Images")
         try:
@@ -238,9 +299,7 @@ class MediaPanelConversionParityTests(unittest.TestCase):
             assert select_item is not None
             select_item.setCheckState(Qt.CheckState.Checked)
 
-            self.assertTrue(hasattr(panel, "_do_not_replace"))
-            self.assertTrue(panel._do_not_replace.isChecked())
-            self.assertFalse(panel._do_not_replace.isEnabled())
+            self.assertFalse(hasattr(panel, "_do_not_replace"))
             self.assertTrue(panel._convert_button.isEnabled())
         finally:
             panel.close()

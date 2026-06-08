@@ -1,5 +1,6 @@
 import os
 import subprocess
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 from reencode import codec_probe
 from reencode import presets as presets_data
 from reencode import size_estimator
-from reencode.subprocess_util import popen_hidden
+from reencode.subprocess_util import popen_hidden, run_hidden
 from reencode.virtual_media_model import VirtualMediaTableModel, recommendation_color
 
 
@@ -122,6 +123,7 @@ _FILTER_RECOMMEND_OPTIONS = (
     ("Re-encode", "reencode"),
     ("Keep", "keep"),
 )
+_GPU_SETTING_KEY = "conversion/use_gpu"
 
 _VIDEO_CODEC_ENCODER_ARGS: dict[str, list[str]] = {
     "av1": ["-c:v", "libaom-av1", "-crf", "32", "-b:v", "0", "-cpu-used", "6"],
@@ -302,6 +304,74 @@ def _recommended_ffmpeg_args(recommended_label: str, source_codec: str | None = 
     return _VIDEO_CODEC_ENCODER_ARGS.get(codec_name, _VIDEO_CODEC_ENCODER_ARGS["hevc"])
 
 
+@lru_cache(maxsize=1)
+def _available_ffmpeg_encoders() -> set[str]:
+    try:
+        result = run_hidden(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return set()
+
+    if result.returncode != 0:
+        return set()
+
+    encoders: set[str] = set()
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if not text or text.startswith("------"):
+            continue
+        parts = text.split()
+        if len(parts) < 2:
+            continue
+        if parts[0].startswith("V"):
+            encoders.add(parts[1].lower())
+
+    return encoders
+
+
+def _gpu_encoder_candidates(codec_name: str) -> list[str]:
+    if codec_name == "h264":
+        return ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
+    if codec_name == "hevc":
+        return ["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_videotoolbox"]
+    if codec_name == "av1":
+        return ["av1_nvenc", "av1_qsv", "av1_amf"]
+    return []
+
+
+def _recommended_video_ffmpeg_args(
+    recommended_label: str,
+    source_codec: str | None = None,
+    use_gpu: bool = False,
+) -> list[str]:
+    software_args = _recommended_ffmpeg_args(recommended_label, source_codec=source_codec)
+    if not use_gpu:
+        return software_args
+
+    codec_name = _normalize_codec_name(recommended_label)
+    if codec_name == "original":
+        codec_name = _normalize_codec_name(source_codec)
+
+    if codec_name not in {"h264", "hevc", "av1"}:
+        return software_args
+
+    available_encoders = _available_ffmpeg_encoders()
+    if not available_encoders:
+        return software_args
+
+    for encoder in _gpu_encoder_candidates(codec_name):
+        if encoder in available_encoders:
+            return ["-c:v", encoder]
+
+    return software_args
+
+
 def _recommended_audio_ffmpeg_args(recommended_label: str, source_codec: str | None = None) -> list[str]:
     codec_name = _normalize_codec_name(recommended_label)
     if codec_name == "original":
@@ -386,14 +456,53 @@ def _temporary_output_path(final_output_path: str) -> str:
     return str(final_output.with_name(temp_name))
 
 
+class _ConvertOptionsDialog(QDialog):
+    def __init__(self, media_type: str, default_do_not_replace: bool, default_use_gpu: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Convert selected")
+
+        layout = QVBoxLayout(self)
+
+        self._do_not_replace = QCheckBox("Do not replace original")
+        self._do_not_replace.setChecked(default_do_not_replace)
+        if media_type == "Images":
+            self._do_not_replace.setChecked(True)
+            self._do_not_replace.setEnabled(False)
+            self._do_not_replace.setToolTip("Images are always written as new files.")
+        else:
+            self._do_not_replace.setToolTip("When checked, conversion creates a separate .reencoded output file.")
+        layout.addWidget(self._do_not_replace)
+
+        self._use_gpu = QCheckBox("Use GPU")
+        self._use_gpu.setChecked(default_use_gpu)
+        self._use_gpu.setToolTip("Auto-detect available hardware video encoders and fall back to CPU if unavailable.")
+        layout.addWidget(self._use_gpu)
+
+        helper = QLabel("GPU mode applies to video only and automatically falls back to software encoding when needed.")
+        helper.setWordWrap(True)
+        layout.addWidget(helper)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def do_not_replace(self) -> bool:
+        return self._do_not_replace.isChecked()
+
+    def use_gpu(self) -> bool:
+        return self._use_gpu.isChecked()
+
+
 class _ConversionThread(QThread):
     progress = Signal(str, int, int, object)
     finished = Signal(bool, str)
 
-    def __init__(self, jobs: list[tuple[str, str, str, str]], replace_originals: bool, parent=None):
+    def __init__(self, jobs: list[tuple[str, str, str, str]], replace_originals: bool, use_gpu: bool, parent=None):
         super().__init__(parent)
         self._jobs = jobs
         self._replace_originals = replace_originals
+        self._use_gpu = use_gpu
 
     def _job_conversion_inputs(self, media_type: str, source_path: str, recommended_label: str) -> tuple[list[str], float | None]:
         probe_info = codec_probe.probe_media_info(source_path) or {}
@@ -404,7 +513,11 @@ class _ConversionThread(QThread):
             codec_name = source_video_codec.lower()
             if not recommended_label:
                 _status, recommended_label, _reason = codec_probe.recommendation(codec_name)
-            ffmpeg_args = _recommended_ffmpeg_args(recommended_label, source_codec=source_video_codec)
+            ffmpeg_args = _recommended_video_ffmpeg_args(
+                recommended_label,
+                source_codec=source_video_codec,
+                use_gpu=self._use_gpu,
+            )
             duration_seconds = probe_info.get("duration")
         elif media_type == "Audio":
             ffmpeg_args = _recommended_audio_ffmpeg_args(recommended_label, source_codec=source_audio_codec)
@@ -691,11 +804,6 @@ class MediaPanel(QWidget):
             self._select_all.stateChanged.connect(self._on_select_all_changed)
             top_bar.addWidget(self._select_all)
 
-            self._do_not_replace = QCheckBox("Do not replace original")
-            self._do_not_replace.setChecked(False)
-            self._do_not_replace.setToolTip("When checked, conversion creates a separate .reencoded output file.")
-            top_bar.addWidget(self._do_not_replace)
-
             self._convert_button = QPushButton("Convert selected")
             self._convert_button.setEnabled(False)
             self._convert_button.clicked.connect(self._convert_selected)
@@ -805,11 +913,6 @@ class MediaPanel(QWidget):
 
         enabled = not self._scan_locked and self._conversion_thread is None
         self._convert_button.setEnabled(selected > 0 and enabled)
-        if self._media_type == "Images":
-            self._do_not_replace.setChecked(True)
-            self._do_not_replace.setEnabled(False)
-        else:
-            self._do_not_replace.setEnabled(total > 0 and enabled)
         self._select_all.setEnabled(total > 0 and enabled)
         self._refresh_pagination_controls()
         self._update_label()
@@ -1444,9 +1547,28 @@ class MediaPanel(QWidget):
         if self._conversion_thread is not None:
             return
 
-        replace_originals = not self._do_not_replace.isChecked()
+        selected_count = self._selected_row_count()
+        if selected_count <= 0:
+            QMessageBox.information(self, "Convert selected", "Select at least one file first.")
+            return
+
+        default_use_gpu = str(self._settings.value(_GPU_SETTING_KEY, "1")).strip().lower() not in {"0", "false", "no", "off"}
+        options_dialog = _ConvertOptionsDialog(
+            self._media_type,
+            default_do_not_replace=self._media_type == "Images",
+            default_use_gpu=default_use_gpu,
+            parent=self,
+        )
+        if options_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        use_gpu = options_dialog.use_gpu()
+        self._settings.setValue(_GPU_SETTING_KEY, use_gpu)
+
+        replace_originals = not options_dialog.do_not_replace()
         if self._media_type == "Images":
             replace_originals = False
+
         jobs = self._selected_jobs(replace_originals)
         if not jobs:
             QMessageBox.information(self, "Convert selected", "Select at least one file first.")
@@ -1456,11 +1578,15 @@ class MediaPanel(QWidget):
         try:
             self._convert_button.setEnabled(False)
             self._select_all.setEnabled(False)
-            self._do_not_replace.setEnabled(False)
         finally:
             self._suspend_check_updates = False
 
-        self._conversion_thread = _ConversionThread(jobs, replace_originals=replace_originals, parent=self)
+        self._conversion_thread = _ConversionThread(
+            jobs,
+            replace_originals=replace_originals,
+            use_gpu=use_gpu,
+            parent=self,
+        )
         self._conversion_thread.progress.connect(self._on_conversion_progress)
         self._conversion_thread.finished.connect(self._on_conversion_finished)
         action = "Replacing originals" if replace_originals else "Creating converted copies"

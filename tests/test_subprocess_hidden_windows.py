@@ -9,7 +9,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from reencode import codec_probe
-from reencode.media_panel import _ConversionThread
+from reencode.media_panel import _ConversionThread, _recommended_video_ffmpeg_args
 from reencode.subprocess_util import popen_hidden, run_hidden
 
 
@@ -58,6 +58,7 @@ class SubprocessHiddenWindowsTests(unittest.TestCase):
         thread = _ConversionThread(
             jobs=[("Audio", "C:/tmp/in.mp3", "C:/tmp/out.m4a", "")],
             replace_originals=False,
+            use_gpu=False,
         )
 
         finished_payloads: list[tuple[bool, str]] = []
@@ -71,6 +72,18 @@ class SubprocessHiddenWindowsTests(unittest.TestCase):
         success, message = finished_payloads[0]
         self.assertFalse(success)
         self.assertIn("ffmpeg was not found", message)
+
+    def test_recommended_video_args_prefers_gpu_encoder_when_available(self):
+        with mock.patch("reencode.media_panel._available_ffmpeg_encoders", return_value={"h264_nvenc"}):
+            args = _recommended_video_ffmpeg_args("H.264", source_codec="h264", use_gpu=True)
+
+        self.assertEqual(args, ["-c:v", "h264_nvenc"])
+
+    def test_recommended_video_args_falls_back_to_software_when_gpu_unavailable(self):
+        with mock.patch("reencode.media_panel._available_ffmpeg_encoders", return_value=set()):
+            args = _recommended_video_ffmpeg_args("H.264", source_codec="h264", use_gpu=True)
+
+        self.assertEqual(args, ["-c:v", "libx264", "-crf", "23", "-preset", "medium"])
 
 
 if __name__ == "__main__":
