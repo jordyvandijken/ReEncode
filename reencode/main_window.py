@@ -46,7 +46,7 @@ class _LazyScanStore:
 
 
 class _MetadataProbeWorker(QThread):
-    row_ready = Signal(int, str, str, object, str, object, object, object, object)
+    row_ready = Signal(int, str, str, object, str, object, object, object, object, object)
     failed_item = Signal(int, str, str, str, str)
     progress = Signal(int, str, int, int)
     completed = Signal(int, str, bool, int, int)
@@ -98,6 +98,17 @@ class _MetadataProbeWorker(QThread):
                 return root
         return self._source_roots[0] if self._source_roots else normalized
 
+    def _probe_with_retry(self, path: str) -> tuple[dict | None, str]:
+        probe_info = codec_probe.probe_media_info(path)
+        if isinstance(probe_info, dict):
+            return probe_info, "complete"
+
+        retry_probe = codec_probe.probe_media_info(path)
+        if isinstance(retry_probe, dict):
+            return retry_probe, "complete"
+
+        return None, "failed"
+
     def run(self):
         store = ScanStore(db_path=Path(self._store_path))
         try:
@@ -138,17 +149,20 @@ class _MetadataProbeWorker(QThread):
                 encoding = None
                 estimate = None
                 recommend = None
+                probe_state = None
 
                 if media_type in {"Videos", "Audio"}:
                     probe_info = store.find_reusable_probe(path, size_bytes, modified_int)
-                    if probe_info is None:
-                        probe_info = codec_probe.probe_media_info(path)
-                        if probe_info is None:
+                    if isinstance(probe_info, dict):
+                        probe_state = "complete"
+                    else:
+                        probe_info, probe_state = self._probe_with_retry(path)
+                        if probe_state == "failed":
                             self.failed_item.emit(
                                 self._scan_id,
                                 media_type,
                                 path,
-                                "Probe failed",
+                                "Probe failed after retry",
                                 ScanPhase.PROBE.value,
                             )
 
@@ -171,6 +185,7 @@ class _MetadataProbeWorker(QThread):
                     encoding,
                     estimate,
                     recommend,
+                    probe_state,
                 )
                 source_root = self._source_root_for_path(path)
                 try:
@@ -242,7 +257,7 @@ class MainWindow(QMainWindow):
         self._discovered_files: list[tuple[str, str]] = []
         self._pending_metadata_rows: dict[str, list[tuple[str, int, str]]] = {}
         self._pending_metadata_updates: dict[str, list[tuple[str, int, str, int | None]]] = {}
-        self._pending_probe_updates: dict[str, tuple[str, dict | None]] = {}
+        self._pending_probe_updates: dict[str, tuple[str, dict | None, str | None]] = {}
         self._pending_failed_rows: list[tuple[str, str, str]] = []
 
         self._metadata_processed = 0
@@ -540,13 +555,17 @@ class MainWindow(QMainWindow):
         encoding: str | None,
         estimate: int | None,
         _recommend: str | None,
+        probe_state: str | None = None,
     ):
         if scan_token != self._scan_token:
             return
 
         self._pending_metadata_updates.setdefault(media_type, []).append((path, int(size_bytes), modified_timestamp, estimate))
         if media_type in {"Videos", "Audio"}:
-            self._pending_probe_updates[path] = (media_type, probe_info)
+            resolved_probe_state = probe_state
+            if resolved_probe_state is None:
+                resolved_probe_state = "complete" if isinstance(probe_info, dict) else "pending"
+            self._pending_probe_updates[path] = (media_type, probe_info, resolved_probe_state)
 
         if not self._metadata_flush_timer.isActive():
             self._metadata_flush_timer.start()
@@ -660,13 +679,13 @@ class MainWindow(QMainWindow):
                 self._probe_flush_timer.stop()
             return
 
-        per_media: dict[str, list[tuple[str, dict | None]]] = {}
+        per_media: dict[str, list[tuple[str, dict | None, str | None]]] = {}
         flush_start = perf_counter()
         target_limit = limit if limit > 0 else 150
         count = 0
 
-        for path, (media_type, probe_info) in list(self._pending_probe_updates.items()):
-            per_media.setdefault(media_type, []).append((path, probe_info))
+        for path, (media_type, probe_info, probe_state) in list(self._pending_probe_updates.items()):
+            per_media.setdefault(media_type, []).append((path, probe_info, probe_state))
             del self._pending_probe_updates[path]
 
             count += 1

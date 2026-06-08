@@ -163,6 +163,89 @@ class MetadataProbeWorkerTests(unittest.TestCase):
             self.assertTrue(cancelled)
             self.assertEqual(processed, 1)
 
+    def test_probe_retry_success_marks_complete_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir(parents=True, exist_ok=True)
+            media_file = root / "retry-ok.mp4"
+            media_file.write_bytes(b"retry-ok")
+
+            worker = _MetadataProbeWorker(
+                scan_id=11,
+                store_path=str(Path(tmp) / "scan.db"),
+                source_roots=[str(root)],
+            )
+
+            row_payloads: list[tuple] = []
+            failed_payloads: list[tuple] = []
+            completed_payloads: list[tuple[int, str, bool, int, int]] = []
+            worker.row_ready.connect(lambda *args: row_payloads.append(args))
+            worker.failed_item.connect(lambda *args: failed_payloads.append(args))
+            worker.completed.connect(lambda *args: completed_payloads.append(args))
+
+            worker.submit("Videos", str(media_file))
+            worker.finish(expected_total=1)
+
+            with mock.patch(
+                "reencode.codec_probe.probe_media_info",
+                side_effect=[None, {"video_codec": "h264", "duration": 1.0}],
+            ):
+                worker.run()
+
+            self.assertEqual(len(row_payloads), 1)
+            self.assertEqual(row_payloads[0][9], "complete")
+            self.assertIsInstance(row_payloads[0][5], dict)
+            self.assertEqual(len(failed_payloads), 0)
+
+            self.assertEqual(len(completed_payloads), 1)
+            scan_id, phase, cancelled, processed, probed = completed_payloads[0]
+            self.assertEqual(scan_id, 11)
+            self.assertEqual(phase, "metadata")
+            self.assertFalse(cancelled)
+            self.assertEqual(processed, 1)
+            self.assertEqual(probed, 1)
+
+    def test_probe_retry_exhausted_marks_failed_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir(parents=True, exist_ok=True)
+            media_file = root / "retry-fail.mp4"
+            media_file.write_bytes(b"retry-fail")
+
+            worker = _MetadataProbeWorker(
+                scan_id=12,
+                store_path=str(Path(tmp) / "scan.db"),
+                source_roots=[str(root)],
+            )
+
+            row_payloads: list[tuple] = []
+            failed_payloads: list[tuple] = []
+            completed_payloads: list[tuple[int, str, bool, int, int]] = []
+            worker.row_ready.connect(lambda *args: row_payloads.append(args))
+            worker.failed_item.connect(lambda *args: failed_payloads.append(args))
+            worker.completed.connect(lambda *args: completed_payloads.append(args))
+
+            worker.submit("Videos", str(media_file))
+            worker.finish(expected_total=1)
+
+            with mock.patch("reencode.codec_probe.probe_media_info", side_effect=[None, None]):
+                worker.run()
+
+            self.assertEqual(len(row_payloads), 1)
+            self.assertIsNone(row_payloads[0][5])
+            self.assertEqual(row_payloads[0][9], "failed")
+
+            self.assertEqual(len(failed_payloads), 1)
+            self.assertIn("Probe failed after retry", failed_payloads[0][3])
+
+            self.assertEqual(len(completed_payloads), 1)
+            scan_id, phase, cancelled, processed, probed = completed_payloads[0]
+            self.assertEqual(scan_id, 12)
+            self.assertEqual(phase, "metadata")
+            self.assertFalse(cancelled)
+            self.assertEqual(processed, 1)
+            self.assertEqual(probed, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

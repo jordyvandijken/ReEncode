@@ -569,6 +569,7 @@ class MediaPanel(QWidget):
         self._pagination_restoring = False
         self._pagination_last_state: tuple[int, int, int] | None = None
         self._probe_by_path: dict[str, dict | None] = {}
+        self._probe_state_by_path: dict[str, str] = {}
         self._presets_by_id = presets_data.presets_by_id(presets_data.load_presets())
         self._active_preset_id: str | None = None
         self._filter_dialog: _FilterDialog | None = None
@@ -607,12 +608,14 @@ class MediaPanel(QWidget):
                 if not path:
                     continue
                 probe_info = self._probe_by_path.get(path)
-                codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
+                probe_state = self._probe_state_by_path.get(path, "pending")
+                codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info, probe_state)
                 size_bytes = int(row_data.get("size_bytes") or 0)
                 estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(
                     path,
                     size_bytes,
                     probe_info,
+                    probe_state=probe_state,
                     recommended_label=rec_label,
                 )
                 estimate_change_pct = _estimate_change_pct(size_bytes, float(estimate_sort)) if estimate_sort >= 0 else None
@@ -639,7 +642,7 @@ class MediaPanel(QWidget):
                 if path_item is None:
                     continue
                 path = path_item.text()
-                self._apply_probe_update(path, self._probe_by_path.get(path))
+                self._apply_probe_update(path, self._probe_by_path.get(path), self._probe_state_by_path.get(path))
         finally:
             self._table.setUpdatesEnabled(True)
             self._table.setSortingEnabled(True)
@@ -1144,19 +1147,26 @@ class MediaPanel(QWidget):
         self._rebuild_path_rows()
         return self._path_rows.get(path)
 
-    def _video_details_items(self, path: str, size_bytes: int, probe_info: dict | None):
+    def _video_details_items(self, path: str, size_bytes: int, probe_info: dict | None, probe_state: str = "pending"):
         raw_codec = (probe_info or {}).get("video_codec")
         if raw_codec:
             codec_text = codec_probe.codec_label(raw_codec)
-            rec_label, reason, status = self._recommended_values(path, str(raw_codec), codec_text)
+            rec_label, reason, status = self._recommended_values(path, str(raw_codec), codec_text, "complete")
+        elif probe_state == "failed":
+            codec_text = "Probe failed"
+            rec_label, reason, status = self._recommended_values(path, None, codec_text, probe_state)
         else:
             codec_text = "Probing..."
-            rec_label, reason, status = self._recommended_values(path, None, codec_text)
+            rec_label, reason, status = self._recommended_values(path, None, codec_text, probe_state)
 
         if probe_info is None:
-            estimate_item = _NumericItem("Pending probe", -1)
+            if probe_state == "failed":
+                estimate_item = _NumericItem("Probe failed", -1)
+                estimate_item.setToolTip("Probe failed after retry. Estimate unavailable until next scan.")
+            else:
+                estimate_item = _NumericItem("Pending probe", -1)
+                estimate_item.setToolTip("Estimate appears after probe completes.")
             estimate_item.setFlags(estimate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            estimate_item.setToolTip("Estimate appears after probe completes.")
             codec_item = QTableWidgetItem(codec_text)
 
             rec_item = QTableWidgetItem(rec_label)
@@ -1214,12 +1224,19 @@ class MediaPanel(QWidget):
 
         return codec_item, rec_item, estimate_item
 
-    def _audio_estimate_item(self, path: str, size_bytes: int, probe_info: dict | None):
-        estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(path, size_bytes, probe_info)
+    def _audio_estimate_item(self, path: str, size_bytes: int, probe_info: dict | None, probe_state: str = "pending"):
+        estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(
+            path,
+            size_bytes,
+            probe_info,
+            probe_state=probe_state,
+        )
         estimate_item = _NumericItem(estimate_text, estimate_sort)
         estimate_item.setData(Qt.ItemDataRole.UserRole, estimate_sort)
         if estimate_text == "Pending probe":
             estimate_item.setToolTip("Estimate appears after probe completes.")
+        elif estimate_text == "Probe failed":
+            estimate_item.setToolTip("Probe failed after retry. Estimate unavailable until next scan.")
         elif estimate_sort >= 0:
             estimate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             if estimate_tip:
@@ -1235,13 +1252,20 @@ class MediaPanel(QWidget):
         path: str,
         size_bytes: int,
         probe_info: dict | None,
+        probe_state: str = "pending",
         recommended_label: str | None = None,
     ) -> tuple[str, float, str | None]:
         if self._media_type.lower() == "audio" and probe_info is None:
+            if probe_state == "failed":
+                return "Probe failed", -1, "Probe failed after retry. Estimate unavailable until next scan."
             return "Pending probe", -1, "Estimate appears after probe completes."
 
         if recommended_label is None:
-            _codec_text, recommended_label, _reason, _status = self._base_codec_recommend_values(path, probe_info)
+            _codec_text, recommended_label, _reason, _status = self._base_codec_recommend_values(
+                path,
+                probe_info,
+                probe_state,
+            )
 
         estimate_path = path
         if self._media_type == "Images":
@@ -1265,8 +1289,8 @@ class MediaPanel(QWidget):
             tip = estimate.reason if (estimate.fallback_used or estimate.clamped) else None
             return estimate_text, estimate.estimated_size, tip
 
-    def _base_codec_recommend_items(self, path: str, probe_info: dict | None):
-        codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
+    def _base_codec_recommend_items(self, path: str, probe_info: dict | None, probe_state: str = "pending"):
+        codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info, probe_state)
 
         codec_item = QTableWidgetItem(codec_text)
         rec_item = QTableWidgetItem(rec_label)
@@ -1286,32 +1310,46 @@ class MediaPanel(QWidget):
 
         return codec_item, rec_item
 
-    def _base_codec_recommend_values(self, path: str, probe_info: dict | None) -> tuple[str, str, str, str]:
+    def _base_codec_recommend_values(
+        self,
+        path: str,
+        probe_info: dict | None,
+        probe_state: str = "pending",
+    ) -> tuple[str, str, str, str]:
         if self._media_type == "Images":
             file_ext = os.path.splitext(path)[1].lower()
             if file_ext:
-                rec_label, reason, status = self._recommended_values(path, file_ext, file_ext)
+                rec_label, reason, status = self._recommended_values(path, file_ext, file_ext, "complete")
                 return file_ext, rec_label, reason, status
-            rec_label, reason, status = self._recommended_values(path, None, "Unknown")
+            rec_label, reason, status = self._recommended_values(path, None, "Unknown", probe_state)
             return "Unknown", rec_label, reason, status
 
         if self._media_type == "Audio":
             raw_codec = (probe_info or {}).get("audio_codec")
             if raw_codec:
                 codec_text = codec_probe.codec_label(raw_codec)
-                rec_label, reason, status = self._recommended_values(path, str(raw_codec), codec_text)
+                rec_label, reason, status = self._recommended_values(path, str(raw_codec), codec_text, "complete")
+            elif probe_info is None and probe_state == "failed":
+                codec_text = "Probe failed"
+                rec_label, reason, status = self._recommended_values(path, None, codec_text, probe_state)
             elif probe_info is None:
                 codec_text = "Probing..."
-                rec_label, reason, status = self._recommended_values(path, None, codec_text)
+                rec_label, reason, status = self._recommended_values(path, None, codec_text, probe_state)
             else:
                 codec_text = "Unknown"
-                rec_label, reason, status = self._recommended_values(path, None, codec_text)
+                rec_label, reason, status = self._recommended_values(path, None, codec_text, probe_state)
         else:
             codec_text = "-"
             status, rec_label, reason = ("pending", "-", "Recommendations are only available for audio/video codecs.")
         return codec_text, rec_label, reason, status
 
-    def _recommended_values(self, path: str, raw_codec: str | None, codec_text: str) -> tuple[str, str, str]:
+    def _recommended_values(
+        self,
+        path: str,
+        raw_codec: str | None,
+        codec_text: str,
+        probe_state: str = "pending",
+    ) -> tuple[str, str, str]:
         entry = self._active_preset_entry()
         if entry is None:
             if self._media_type == "Images":
@@ -1324,6 +1362,8 @@ class MediaPanel(QWidget):
             if raw_codec:
                 status, rec_label, reason = codec_probe.recommendation(raw_codec)
                 return rec_label, reason, status
+            if probe_state == "failed":
+                return "Probe failed", "Probe failed after retry. Codec recommendation unavailable.", "reencode"
             return "Pending probe", "Codec details will appear after the async probe phase.", "pending"
 
         target_codec = entry.codec
@@ -1333,6 +1373,8 @@ class MediaPanel(QWidget):
         if target_norm == "original":
             if raw_codec:
                 return codec_text, self._preset_reason(entry, "Uses the source codec."), "optimal"
+            if probe_state == "failed":
+                return "Probe failed", self._preset_reason(entry, "Probe failed after retry."), "reencode"
             return "Original", self._preset_reason(entry, "Uses the source codec."), "pending"
 
         status = "reencode"
@@ -1343,12 +1385,20 @@ class MediaPanel(QWidget):
 
         return target_codec, self._preset_reason(entry, f"Target codec: {target_codec}"), status
 
-    def _virtual_row(self, path: str, size_bytes: int, modified_timestamp: str, probe_info: dict | None) -> dict:
-        codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
+    def _virtual_row(
+        self,
+        path: str,
+        size_bytes: int,
+        modified_timestamp: str,
+        probe_info: dict | None,
+        probe_state: str = "pending",
+    ) -> dict:
+        codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info, probe_state)
         estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(
             path,
             size_bytes,
             probe_info,
+            probe_state=probe_state,
             recommended_label=rec_label,
         )
         estimate_change_pct = _estimate_change_pct(int(size_bytes), float(estimate_sort)) if estimate_sort >= 0 else None
@@ -1443,6 +1493,7 @@ class MediaPanel(QWidget):
 
     def _insert_file_row(self, path: str, size_bytes: int = 0, modified_timestamp: str = ""):
         self._probe_by_path.setdefault(path, None)
+        self._probe_state_by_path[path] = "pending"
         row = self._table.rowCount()
         self._table.insertRow(row)
 
@@ -1460,7 +1511,7 @@ class MediaPanel(QWidget):
         modified_item = QTableWidgetItem(modified)
 
         if self._is_video:
-            codec_item, rec_item, estimate_item = self._video_details_items(path, size_bytes, None)
+            codec_item, rec_item, estimate_item = self._video_details_items(path, size_bytes, None, "pending")
 
             select_item = QTableWidgetItem()
             select_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
@@ -1479,8 +1530,8 @@ class MediaPanel(QWidget):
             self._table.setItem(row, VCOL_PATH, path_item)
             self._table.setItem(row, VCOL_MODIFIED, modified_item)
         elif self._supports_conversion:
-            codec_item, rec_item = self._base_codec_recommend_items(path, None)
-            estimate_item = self._audio_estimate_item(path, size_bytes, None)
+            codec_item, rec_item = self._base_codec_recommend_items(path, None, "pending")
+            estimate_item = self._audio_estimate_item(path, size_bytes, None, "pending")
 
             select_item = QTableWidgetItem()
             select_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
@@ -1499,8 +1550,8 @@ class MediaPanel(QWidget):
             self._table.setItem(row, VCOL_PATH, path_item)
             self._table.setItem(row, VCOL_MODIFIED, modified_item)
         else:
-            codec_item, rec_item = self._base_codec_recommend_items(path, None)
-            estimate_item = self._audio_estimate_item(path, size_bytes, None)
+            codec_item, rec_item = self._base_codec_recommend_items(path, None, "pending")
+            estimate_item = self._audio_estimate_item(path, size_bytes, None, "pending")
 
             for item in (name_item, size_item, codec_item, rec_item, estimate_item, path_item, modified_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -1551,7 +1602,7 @@ class MediaPanel(QWidget):
             assert self._virtual_model is not None
             self._table.setSortingEnabled(False)
             self._virtual_model.append_rows(
-                [self._virtual_row(path, size_bytes, modified_timestamp, None) for path, size_bytes, modified_timestamp in rows]
+                [self._virtual_row(path, size_bytes, modified_timestamp, None, "pending") for path, size_bytes, modified_timestamp in rows]
             )
             self._table.setSortingEnabled(True)
             self._apply_pagination(save_settings=False)
@@ -1694,12 +1745,23 @@ class MediaPanel(QWidget):
         self._invalidate_path_rows()
         self._pagination_last_state = None
 
-    def update_probes(self, updates: list[tuple[str, dict | None]]):
+    def update_probes(self, updates: list[tuple]):
         if not updates:
             return
 
-        for path, probe_info in updates:
+        normalized_updates: list[tuple[str, dict | None, str]] = []
+        for update in updates:
+            if len(update) >= 3:
+                raw_path, probe_info, probe_state = update[:3]
+            else:
+                raw_path, probe_info = update[:2]
+                probe_state = None
+
+            path = str(raw_path)
+            resolved_state = str(probe_state) if probe_state else ("complete" if isinstance(probe_info, dict) else "pending")
+            normalized_updates.append((path, probe_info, resolved_state))
             self._probe_by_path[path] = probe_info
+            self._probe_state_by_path[path] = resolved_state
 
         if self._use_virtual_table:
             assert self._virtual_model is not None
@@ -1709,15 +1771,16 @@ class MediaPanel(QWidget):
                 restore_sorting = True
 
             row_updates: dict[str, dict] = {}
-            for path, probe_info in self._prioritize_updates(updates):
+            for path, probe_info, probe_state in self._prioritize_updates(normalized_updates):
                 size_bytes = self._virtual_model.size_for_path(path)
                 if size_bytes is None:
                     continue
-                codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info)
+                codec_text, rec_label, reason, status = self._base_codec_recommend_values(path, probe_info, probe_state)
                 estimate_text, estimate_sort, estimate_tip = self._audio_estimate_values(
                     path,
                     size_bytes,
                     probe_info,
+                    probe_state=probe_state,
                     recommended_label=rec_label,
                 )
                 estimate_change_pct = _estimate_change_pct(size_bytes, float(estimate_sort)) if estimate_sort >= 0 else None
@@ -1746,19 +1809,25 @@ class MediaPanel(QWidget):
 
         self._table.setUpdatesEnabled(False)
         try:
-            for path, probe_info in self._prioritize_updates(updates):
-                self._apply_probe_update(path, probe_info)
+            for path, probe_info, probe_state in self._prioritize_updates(normalized_updates):
+                self._apply_probe_update(path, probe_info, probe_state)
         finally:
             self._table.setUpdatesEnabled(True)
 
         if restore_sorting:
             self._table.setSortingEnabled(True)
 
-    def _apply_probe_update(self, path: str, probe_info: dict | None):
+    def _apply_probe_update(self, path: str, probe_info: dict | None, probe_state: str | None = None):
         if probe_info is not None:
             self._probe_by_path[path] = probe_info
         elif path in self._probe_by_path:
             probe_info = self._probe_by_path[path]
+
+        if probe_state is None:
+            probe_state = self._probe_state_by_path.get(path)
+        if probe_state is None:
+            probe_state = "complete" if isinstance(probe_info, dict) else "pending"
+        self._probe_state_by_path[path] = probe_state
 
         row = self._row_for_path(path)
         if row is None:
@@ -1771,21 +1840,21 @@ class MediaPanel(QWidget):
         size_bytes = int(size_item.data(Qt.ItemDataRole.UserRole) or 0)
 
         if self._is_video:
-            codec_item, rec_item, estimate_item = self._video_details_items(path, size_bytes, probe_info)
+            codec_item, rec_item, estimate_item = self._video_details_items(path, size_bytes, probe_info, probe_state)
             self._table.setItem(row, VCOL_CODEC, codec_item)
             self._table.setItem(row, VCOL_REC, rec_item)
             self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
         elif self._supports_conversion:
-            codec_item, rec_item = self._base_codec_recommend_items(path, probe_info)
+            codec_item, rec_item = self._base_codec_recommend_items(path, probe_info, probe_state)
             self._table.setItem(row, VCOL_CODEC, codec_item)
             self._table.setItem(row, VCOL_REC, rec_item)
-            estimate_item = self._audio_estimate_item(path, size_bytes, probe_info)
+            estimate_item = self._audio_estimate_item(path, size_bytes, probe_info, probe_state)
             self._table.setItem(row, VCOL_ESTIMATE, estimate_item)
         else:
-            codec_item, rec_item = self._base_codec_recommend_items(path, probe_info)
+            codec_item, rec_item = self._base_codec_recommend_items(path, probe_info, probe_state)
             self._table.setItem(row, COL_CODEC, codec_item)
             self._table.setItem(row, COL_REC, rec_item)
-            estimate_item = self._audio_estimate_item(path, size_bytes, probe_info)
+            estimate_item = self._audio_estimate_item(path, size_bytes, probe_info, probe_state)
             self._table.setItem(row, COL_ESTIMATE, estimate_item)
 
     def clear(self):
@@ -1793,6 +1862,7 @@ class MediaPanel(QWidget):
             assert self._virtual_model is not None
             self._virtual_model.clear_rows()
             self._probe_by_path.clear()
+            self._probe_state_by_path.clear()
             self._pagination_page = 0
             self._pagination_last_state = None
             self._apply_pagination(save_settings=True)
@@ -1801,6 +1871,7 @@ class MediaPanel(QWidget):
 
         self._suspend_check_updates = True
         self._probe_by_path.clear()
+        self._probe_state_by_path.clear()
         self._path_rows.clear()
         self._path_rows_dirty = False
         self._table.setRowCount(0)
@@ -1862,16 +1933,16 @@ class MediaPanel(QWidget):
 
         return first_visible, last_visible
 
-    def _prioritize_updates(self, updates: list[tuple[str, dict | None]]) -> list[tuple[str, dict | None]]:
+    def _prioritize_updates(self, updates: list[tuple[str, dict | None, str]]) -> list[tuple[str, dict | None, str]]:
         visible_bounds = self._visible_row_bounds()
-        visible: list[tuple[str, dict | None]] = []
-        hidden: list[tuple[str, dict | None]] = []
-        for path, probe_info in updates:
+        visible: list[tuple[str, dict | None, str]] = []
+        hidden: list[tuple[str, dict | None, str]] = []
+        for path, probe_info, probe_state in updates:
             row = self._row_for_path(path)
             if row is not None and visible_bounds is not None and visible_bounds[0] <= row <= visible_bounds[1]:
-                visible.append((path, probe_info))
+                visible.append((path, probe_info, probe_state))
             else:
-                hidden.append((path, probe_info))
+                hidden.append((path, probe_info, probe_state))
         return visible + hidden
 
     def prioritize_stat_updates(self, updates: list[tuple]) -> list[tuple]:

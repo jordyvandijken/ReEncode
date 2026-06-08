@@ -134,6 +134,29 @@ class MediaPanelPathIndexTests(unittest.TestCase):
         self.assertTrue(self.panel._table.isEnabled())
         self.assertTrue(self.panel._page_size_combo.isEnabled())
 
+    def test_video_probe_retry_exhausted_replaces_pending_labels(self):
+        self.panel.add_file("C:/tmp/broken.mp4", 1000, "1")
+
+        self.panel.update_probes([
+            ("C:/tmp/broken.mp4", None, "failed"),
+        ])
+
+        codec_item = self.panel._table.item(0, VCOL_CODEC)
+        rec_item = self.panel._table.item(0, VCOL_REC)
+        estimate_item = self.panel._table.item(0, VCOL_ESTIMATE)
+
+        self.assertIsNotNone(codec_item)
+        self.assertIsNotNone(rec_item)
+        self.assertIsNotNone(estimate_item)
+        assert codec_item is not None
+        assert rec_item is not None
+        assert estimate_item is not None
+
+        self.assertEqual(codec_item.text(), "Probe failed")
+        self.assertEqual(rec_item.text(), "Probe failed")
+        self.assertEqual(estimate_item.text(), "Probe failed")
+        self.assertEqual(estimate_item.toolTip(), "Probe failed after retry. Estimate unavailable until next scan.")
+
 
 class FailedPanelPaginationTests(unittest.TestCase):
     @classmethod

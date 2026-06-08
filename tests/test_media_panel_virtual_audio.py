@@ -84,6 +84,28 @@ class MediaPanelVirtualAudioTests(unittest.TestCase):
         self.assertEqual(estimate_text, "750 B (-25%) ?")
         self.assertEqual(estimate_tip, "Fallback factor estimate due to unknown codec and missing bitrate context.")
 
+    def test_virtual_audio_probe_retry_exhausted_renders_failed_state(self):
+        self.panel.add_files([
+            ("C:/tmp/broken.mp3", 1000, "1"),
+        ])
+
+        self.panel.update_probes([
+            ("C:/tmp/broken.mp3", None, "failed"),
+        ])
+
+        model = self.panel._virtual_model
+        assert model is not None
+
+        codec_text = model.data(model.index(0, 2), Qt.ItemDataRole.DisplayRole)
+        rec_text = model.data(model.index(0, 3), Qt.ItemDataRole.DisplayRole)
+        estimate_text = model.data(model.index(0, 4), Qt.ItemDataRole.DisplayRole)
+        estimate_tip = model.data(model.index(0, 4), Qt.ItemDataRole.ToolTipRole)
+
+        self.assertEqual(codec_text, "Probe failed")
+        self.assertEqual(rec_text, "Probe failed")
+        self.assertEqual(estimate_text, "Probe failed")
+        self.assertEqual(estimate_tip, "Probe failed after retry. Estimate unavailable until next scan.")
+
     def test_virtual_audio_file_count_tracks_total_rows(self):
         rows = [(f"C:/tmp/song-{idx}.mp3", 1000 + idx, "1") for idx in range(1500)]
         self.panel.add_files(rows)
